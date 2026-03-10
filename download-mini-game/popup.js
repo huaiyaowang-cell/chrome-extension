@@ -37,6 +37,8 @@ function renderStatus(result) {
   }
 
   const s = result.stats || {};
+  const h = result.htmlStatus || {};
+  const htmlLine = h.gameHtml ? "game.html ✓" : (h.gameCached ? "game.html (已缓存)" : "game.html ✗");
   const lines = [
     `状态: 监听中`,
     `游戏: ${result.gameName}`,
@@ -44,6 +46,7 @@ function renderStatus(result) {
     `失败: ${s.failed || 0}`,
     `总请求: ${s.totalSeen || 0}`,
     `文件数: ${result.fileCount || 0}`,
+    `HTML: ${htmlLine}`,
     `目录: ${result.folder}/`
   ];
   setStatus(lines.join("\n"));

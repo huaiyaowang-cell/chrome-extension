@@ -33,6 +33,9 @@ const GAME_EXTENSIONS = new Set([
 let activeSession = null;
 let persistTimer = null;
 let manifestTimer = null;
+let debuggerAttached = false;
+let pendingNetworkCaptures = new Map();
+const networkHtmlCache = new Map();
 
 const sessionReady = restoreSession();
 
@@ -79,20 +82,175 @@ chrome.webRequest.onCompleted.addListener(
   { urls: ["http://*/*", "https://*/*"] }
 );
 
-chrome.webNavigation.onCompleted.addListener((details) => {
-  void sessionReady.then(() => {
-    if (!activeSession || details.tabId !== activeSession.tabId) return;
-    if (activeSession.status !== "listening") return;
-    void captureFrameHtml();
-  });
-});
-
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (activeSession?.tabId === tabId) {
+    void detachDebugger(tabId);
     activeSession = null;
     chrome.storage.local.remove("activeSession");
   }
 });
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (!activeSession || source.tabId !== activeSession.tabId) return;
+  if (activeSession.status !== "listening") return;
+
+  if (method === "Network.responseReceived") {
+    const { response, requestId, type } = params;
+    if (type !== "Document") return;
+    const url = response.url || "";
+    if (url && url.startsWith("http")) {
+      pendingNetworkCaptures.set(requestId, { url });
+      console.log(`[poki-dl] responseReceived: Document → ${url.slice(0, 120)}`);
+    }
+  }
+
+  if (method === "Network.loadingFinished") {
+    const capture = pendingNetworkCaptures.get(params.requestId);
+    if (capture) {
+      pendingNetworkCaptures.delete(params.requestId);
+      void captureResponseBody(source.tabId, params.requestId, capture);
+    }
+  }
+});
+
+chrome.debugger.onDetach.addListener((source, reason) => {
+  if (activeSession && source.tabId === activeSession.tabId) {
+    debuggerAttached = false;
+    pendingNetworkCaptures.clear();
+    console.warn(`[poki-dl] debugger detached: ${reason}`);
+  }
+});
+
+async function attachDebugger(tabId) {
+  if (debuggerAttached) return true;
+  return new Promise((resolve) => {
+    chrome.debugger.attach({ tabId }, "1.3", () => {
+      if (chrome.runtime.lastError) {
+        console.warn("[poki-dl] debugger attach failed:", chrome.runtime.lastError.message);
+        resolve(false);
+        return;
+      }
+      chrome.debugger.sendCommand({ tabId }, "Network.enable", {}, () => {
+        if (chrome.runtime.lastError) {
+          console.warn("[poki-dl] Network.enable failed:", chrome.runtime.lastError.message);
+          resolve(false);
+          return;
+        }
+        debuggerAttached = true;
+        pendingNetworkCaptures.clear();
+        console.log("[poki-dl] debugger attached, Network.enable sent");
+        resolve(true);
+      });
+    });
+  });
+}
+
+async function detachDebugger(tabId) {
+  if (!debuggerAttached) return;
+  debuggerAttached = false;
+  pendingNetworkCaptures.clear();
+  return new Promise((resolve) => {
+    chrome.debugger.detach({ tabId }, () => {
+      if (chrome.runtime.lastError) { /* tab may already be closed */ }
+      resolve();
+    });
+  });
+}
+
+async function captureResponseBody(tabId, requestId, info) {
+  try {
+    const result = await new Promise((resolve, reject) => {
+      chrome.debugger.sendCommand(
+        { tabId },
+        "Network.getResponseBody",
+        { requestId },
+        (res) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          resolve(res);
+        }
+      );
+    });
+
+    const body = result.base64Encoded ? decodeBase64Body(result.body) : result.body;
+    if (!body || body.length < 50) return;
+
+    if (networkHtmlCache.size > 100) {
+      const oldest = networkHtmlCache.keys().next().value;
+      networkHtmlCache.delete(oldest);
+    }
+
+    networkHtmlCache.set(info.url, body);
+    const baseUrl = info.url.split("?")[0];
+    if (baseUrl !== info.url) {
+      networkHtmlCache.set(baseUrl, body);
+    }
+    console.log(`[poki-dl] network HTML cached: ${info.url.slice(0, 120)} (${body.length} bytes, total=${networkHtmlCache.size})`);
+  } catch (e) {
+    console.warn("[poki-dl] getResponseBody failed:", e.message);
+  }
+}
+
+function decodeBase64Body(base64) {
+  const binaryStr = atob(base64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function findInNetworkCache(url) {
+  if (!url) return null;
+  if (networkHtmlCache.has(url)) return networkHtmlCache.get(url);
+  const base = url.split("?")[0];
+  if (base !== url && networkHtmlCache.has(base)) return networkHtmlCache.get(base);
+  try {
+    const target = new URL(url);
+    for (const [cachedUrl, body] of networkHtmlCache) {
+      try {
+        const cached = new URL(cachedUrl);
+        if (cached.host === target.host && cached.pathname === target.pathname) return body;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+async function resolveFrameUrls(tabId) {
+  const allFrames = await chrome.webNavigation.getAllFrames({ tabId });
+  if (!allFrames || allFrames.length === 0) return { gameUrl: null, indexUrl: null };
+
+  let gameUrl = null;
+  let indexUrl = null;
+
+  for (const frame of allFrames) {
+    const url = frame.url || "";
+    const host = safeHost(url);
+
+    if (!gameUrl && GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) {
+      gameUrl = url;
+    }
+
+    if (!indexUrl && frame.parentFrameId === 0 && frame.frameId !== 0 && host !== "" &&
+        (host === "games.poki.com" || host.endsWith(".poki.com")) && !url.includes("/g/")) {
+      indexUrl = url;
+    }
+  }
+
+  if (!indexUrl) {
+    for (const frame of allFrames) {
+      if (frame.parentFrameId === 0 && frame.frameId !== 0 && frame.url) {
+        indexUrl = frame.url;
+        break;
+      }
+    }
+  }
+
+  return { gameUrl, indexUrl };
+}
 
 async function startMonitor(tabId) {
   const pageInfo = await getPageInfoFromTab(tabId);
@@ -127,11 +285,17 @@ async function startMonitor(tabId) {
     htmlCaptured: { index: false, game: false }
   };
 
+  networkHtmlCache.clear();
+  const dbgOk = await attachDebugger(tabId);
+  if (!dbgOk) {
+    console.warn("[poki-dl] debugger not available — cannot capture network HTML");
+  }
+
   await persistSession();
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
   await chrome.action.setBadgeText({ tabId, text: "ON" });
 
-  return { gameName, folder, status: "listening" };
+  return { gameName, folder, status: "listening", debugger: dbgOk };
 }
 
 async function manualCaptureHtml(tabId) {
@@ -139,24 +303,92 @@ async function manualCaptureHtml(tabId) {
     throw new Error("当前没有监听会话。");
   }
 
-  activeSession.htmlCaptured.index = false;
-  activeSession.htmlCaptured.game = false;
-
-  await captureFrameHtml();
+  const { gameUrl, indexUrl } = await resolveFrameUrls(tabId);
+  console.log(`[poki-dl] resolveFrameUrls: gameUrl=${gameUrl?.slice(0, 100) || "null"}, indexUrl=${indexUrl?.slice(0, 100) || "null"}`);
 
   const captured = [];
-  if (activeSession.htmlCaptured.index) captured.push("index.html");
-  if (activeSession.htmlCaptured.game) captured.push("game.html");
+  const errors = [];
 
-  if (captured.length === 0) {
-    throw new Error("未能抓取到任何 HTML，请确认游戏已完全加载。");
+  if (gameUrl) {
+    const rawHtml = findInNetworkCache(gameUrl);
+    if (rawHtml) {
+      await generateAndSaveGameHtml(rawHtml, gameUrl);
+      activeSession.htmlCaptured.game = true;
+      activeSession.htmlCaptured.gameUrl = gameUrl;
+      activeSession.stats.downloaded += 1;
+      captured.push("game.html");
+    } else {
+      errors.push(`game.html: 未检测到 ${gameUrl.slice(0, 80)} 的网络缓存`);
+    }
+  } else {
+    errors.push("game.html: 未发现游戏 iframe");
+  }
+
+  if (indexUrl) {
+    const rawHtml = findInNetworkCache(indexUrl);
+    if (rawHtml) {
+      await generateAndSaveIndexHtml(rawHtml, indexUrl, gameUrl);
+      activeSession.htmlCaptured.index = true;
+      activeSession.htmlCaptured.indexUrl = indexUrl;
+      activeSession.stats.downloaded += 1;
+      captured.push("index.html");
+    } else {
+      errors.push(`index.html: 未检测到 ${indexUrl.slice(0, 80)} 的网络缓存`);
+    }
+  } else {
+    errors.push("index.html: 未发现 index iframe");
   }
 
   await persistSession();
+
+  if (captured.length === 0) {
+    const detail = errors.join("\n");
+    throw new Error(`未能抓取 HTML (网络缓存中有 ${networkHtmlCache.size} 条记录)\n${detail}`);
+  }
+
   return {
     captured,
-    message: `已抓取: ${captured.join(", ")}`
+    errors: errors.length > 0 ? errors : undefined,
+    message: captured.length > 0
+      ? `已抓取: ${captured.join(", ")}` + (errors.length > 0 ? `\n警告: ${errors.join("; ")}` : "")
+      : errors.join("; ")
   };
+}
+
+async function generateAndSaveGameHtml(rawHtml, gameUrl) {
+  const engine = detectGameEngine();
+  const gameFrameBaseUrl = getBaseUrl(gameUrl);
+  const specialMap = buildSpecialUrlMap(gameUrl);
+  const urlMap = buildUrlToLocalMap();
+
+  let html = rawHtml;
+  html = rewriteAllUrls(html, urlMap);
+  html = rewriteRemainingAbsoluteUrls(html, gameFrameBaseUrl);
+  html = neutralizePokiSdk(html);
+  html = removeDynamicLoaderContent(html, engine);
+  html = injectInterceptor(html, gameFrameBaseUrl, specialMap);
+
+  await downloadText(`${activeSession.folder}/game.html`, html, "text/html;charset=utf-8");
+  upsertFile({ type: "entry-html", sourceUrl: gameUrl, localPath: "game.html", status: "ok" });
+  console.log("[poki-dl] game.html generated from network cache");
+}
+
+async function generateAndSaveIndexHtml(rawHtml, indexUrl, gameUrl) {
+  const specialMap = buildSpecialUrlMap(gameUrl);
+  const urlMap = buildUrlToLocalMap();
+
+  let html = rawHtml;
+  if (gameUrl) {
+    html = rewriteGameframeSrc(html, gameUrl, "./game.html");
+  }
+  html = rewriteAllUrls(html, urlMap);
+  html = rewriteRemainingAbsoluteUrls(html, "");
+  html = neutralizePokiSdk(html);
+  html = injectInterceptor(html, "", specialMap);
+
+  await downloadText(`${activeSession.folder}/index.html`, html, "text/html;charset=utf-8");
+  upsertFile({ type: "entry-html", sourceUrl: indexUrl, localPath: "index.html", status: "ok" });
+  console.log("[poki-dl] index.html generated from network cache");
 }
 
 async function stopMonitor(tabId) {
@@ -166,11 +398,17 @@ async function stopMonitor(tabId) {
 
   const errors = [];
 
-  try {
-    await captureFrameHtml();
-  } catch (e) {
-    errors.push(`captureFrameHtml: ${e.message}`);
+  if (!activeSession.htmlCaptured.game || !activeSession.htmlCaptured.index) {
+    try {
+      await manualCaptureHtml(tabId);
+    } catch (e) {
+      errors.push(e.message);
+    }
   }
+
+  try {
+    await detachDebugger(tabId);
+  } catch { /* ignore */ }
 
   activeSession.status = "stopped";
   activeSession.stoppedAt = new Date().toISOString();
@@ -221,7 +459,6 @@ async function handleRequest(details) {
       activeSession.htmlCaptured.indexUrl = url;
     }
 
-    scheduleCaptureFrameHtml();
     return;
   }
 
@@ -329,143 +566,6 @@ function getCoreExtension(pathname) {
   const dotIndex = stripped.lastIndexOf(".");
   if (dotIndex < 0) return "";
   return stripped.slice(dotIndex + 1).toLowerCase();
-}
-
-let captureFrameTimer = null;
-function scheduleCaptureFrameHtml() {
-  clearTimeout(captureFrameTimer);
-  captureFrameTimer = setTimeout(() => {
-    captureFrameTimer = null;
-    void captureFrameHtml();
-  }, 3000);
-}
-
-async function captureFrameHtml() {
-  if (!activeSession) return;
-  if (activeSession.htmlCaptured.index && activeSession.htmlCaptured.game) return;
-
-  try {
-    const allFrames = await chrome.webNavigation.getAllFrames({ tabId: activeSession.tabId });
-    if (!allFrames || allFrames.length === 0) return;
-
-    let gameElementFrameId = -1;
-    let gameElementUrl = "";
-    let gameFrameFrameId = -1;
-    let gameFrameUrl = activeSession.htmlCaptured.gameUrl || "";
-
-    for (const frame of allFrames) {
-      const url = frame.url || "";
-      const host = safeHost(url);
-
-      if (frame.parentFrameId === 0 && frame.frameId !== 0 && host !== "" &&
-          (host === "games.poki.com" || host.endsWith(".poki.com")) && !url.includes("/g/")) {
-        gameElementFrameId = frame.frameId;
-        gameElementUrl = url;
-      }
-
-      if (GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) {
-        gameFrameFrameId = frame.frameId;
-        if (!gameFrameUrl) gameFrameUrl = url;
-      }
-    }
-
-    if (gameElementFrameId < 0) {
-      for (const frame of allFrames) {
-        if (frame.parentFrameId === 0 && frame.frameId !== 0) {
-          gameElementFrameId = frame.frameId;
-          gameElementUrl = frame.url;
-          break;
-        }
-      }
-    }
-
-    if (gameFrameFrameId < 0 && gameElementFrameId >= 0) {
-      for (const frame of allFrames) {
-        if (frame.parentFrameId === gameElementFrameId && frame.frameId !== gameElementFrameId) {
-          gameFrameFrameId = frame.frameId;
-          if (!gameFrameUrl) gameFrameUrl = frame.url;
-          break;
-        }
-      }
-    }
-
-    const engine = detectGameEngine();
-    const gameFrameBaseUrl = getBaseUrl(gameFrameUrl);
-    const specialMap = buildSpecialUrlMap(gameFrameUrl);
-    const staleIds = getStaleElementIds(engine);
-
-    console.log(`[poki-dl] engine=${engine}, staleIds=[${staleIds}]`);
-
-    if (!activeSession.htmlCaptured.game && gameFrameFrameId >= 0) {
-      let gameHtml = await getFrameHtmlWithFallback(activeSession.tabId, gameFrameFrameId, gameFrameUrl);
-      if (gameHtml && gameHtml.length > 50) {
-        const gameUrlMap = buildUrlToLocalMap();
-        gameHtml = rewriteAllUrls(gameHtml, gameUrlMap);
-        gameHtml = rewriteRemainingAbsoluteUrls(gameHtml, gameFrameBaseUrl);
-        gameHtml = neutralizePokiSdk(gameHtml);
-        gameHtml = removeDynamicLoaderContent(gameHtml, engine);
-        gameHtml = removeStaleGameDom(gameHtml, staleIds);
-        gameHtml = injectInterceptor(gameHtml, gameFrameBaseUrl, specialMap);
-        await downloadText(`${activeSession.folder}/game.html`, gameHtml, "text/html;charset=utf-8");
-        upsertFile({ type: "entry-html", sourceUrl: gameFrameUrl, localPath: "game.html", status: "ok" });
-        activeSession.htmlCaptured.game = true;
-        activeSession.stats.downloaded += 1;
-      }
-    }
-
-    if (!activeSession.htmlCaptured.index && gameElementFrameId >= 0) {
-      let indexHtml = await getFrameHtmlWithFallback(activeSession.tabId, gameElementFrameId, gameElementUrl);
-      if (indexHtml && indexHtml.length > 50) {
-        if (gameFrameUrl) {
-          indexHtml = rewriteGameframeSrc(indexHtml, gameFrameUrl, "./game.html");
-        }
-        const indexUrlMap = buildUrlToLocalMap();
-        indexHtml = rewriteAllUrls(indexHtml, indexUrlMap);
-        indexHtml = rewriteRemainingAbsoluteUrls(indexHtml, "");
-        indexHtml = neutralizePokiSdk(indexHtml);
-        indexHtml = injectInterceptor(indexHtml, "", specialMap);
-        await downloadText(`${activeSession.folder}/index.html`, indexHtml, "text/html;charset=utf-8");
-        upsertFile({ type: "entry-html", sourceUrl: gameElementUrl, localPath: "index.html", status: "ok" });
-        activeSession.htmlCaptured.index = true;
-        activeSession.stats.downloaded += 1;
-      }
-    }
-  } catch (error) {
-    console.warn("captureFrameHtml error:", error);
-  }
-}
-
-async function getFrameHtmlWithFallback(tabId, frameId, frameUrl) {
-  let html = "";
-
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [frameId] },
-      func: () => document.documentElement?.outerHTML || ""
-    });
-    html = results?.[0]?.result || "";
-  } catch {}
-
-  if (html && html.length > 50) return html;
-
-  if (frameUrl && frameUrl.startsWith("http")) {
-    const baseUrl = frameUrl.split("?")[0];
-    try {
-      const resp = await fetch(baseUrl);
-      if (resp.ok) html = await resp.text();
-    } catch {}
-
-    if (html && html.length > 50) return html;
-
-    try {
-      const resp = await fetch(frameUrl, {
-        headers: { "Referer": "https://games.poki.com/" }
-      });
-      if (resp.ok) html = await resp.text();
-    } catch {}
-  }
-
-  return html || "";
 }
 
 function rewriteGameframeSrc(html, gameFrameUrl, localPath) {
@@ -657,28 +757,113 @@ function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
     } catch {}
   }
 
-  const sdkStub =
-    `var _pn=function(){};var _pp=function(){return Promise.resolve()};` +
-    `window.PokiSDK={init:_pp,gameplayStart:_pn,gameplayStop:_pn,` +
-      `commercialBreak:_pp,rewardedBreak:function(){return Promise.resolve(!0)},` +
-      `displayAd:_pn,destroyAd:_pn,setDebug:_pn,` +
-      `getURLParam:function(){return""},shareableURL:function(){return Promise.resolve("")},` +
-      `isAdBlocked:function(){return!1},gameLoadingStart:_pn,gameLoadingFinished:_pn,` +
-      `gameLoadingProgress:_pn,gameInteractive:_pn,customEvent:_pn,happyTime:_pn,` +
-      `logError:_pn,roundStart:_pn,roundEnd:_pn,muteAd:_pn,` +
-      `sendHighscore:_pn,togglePlayerAdvertisingConsent:_pn,disableDOMChangeObservation:_pn};` +
-    `console.log("[poki-dl] PokiSDK stub active");`;
+  const sdkStub = `
+    var _pn = function() {};
+    var _pp = function() { return Promise.resolve(); };
 
-  const domSafety =
-    `var _origGBI=Document.prototype.getElementById;` +
-    `Document.prototype.getElementById=function(id){` +
-      `var el=_origGBI.call(this,id);` +
-      `if(!el){el=document.createElement("div");el.id=id;` +
-        `el.style.display="none";el.dataset.pokiPlaceholder="1";` +
-        `if(document.body)document.body.appendChild(el);}` +
-      `return el;};`;
+    var _loadingGone = false;
+    var _loadingIds = [
+      "loading-screen-container", "loader", "loading", "progress-container",
+      "splash", "defold-progress", "unity-loading-bar", "application-splash-wrapper"
+    ];
+
+    function _hideLoading() {
+      if (_loadingGone) return;
+      var found = false;
+
+      for (var i = 0; i < _loadingIds.length; i++) {
+        var el = document.querySelector("#" + CSS.escape(_loadingIds[i]) + ":not([data-poki-placeholder])");
+        if (el && el.parentElement) {
+          el.parentElement.removeChild(el);
+          found = true;
+        }
+      }
+
+      try {
+        if (typeof ProgressView !== "undefined"
+            && ProgressView.progress
+            && ProgressView.progress.parentElement
+            && !ProgressView.progress.dataset.pokiPlaceholder) {
+          ProgressView.progress.parentElement.removeChild(ProgressView.progress);
+          found = true;
+        }
+      } catch (e) {}
+
+      if (found) {
+        _loadingGone = true;
+        console.log("[poki-dl] loading overlay removed");
+      }
+    }
+
+    var _hlTimer = setInterval(function() {
+      _hideLoading();
+      if (_loadingGone) clearInterval(_hlTimer);
+    }, 2000);
+    setTimeout(function() { clearInterval(_hlTimer); }, 30000);
+
+    window.PokiSDK = {
+      init: _pp,
+      gameplayStart: _pn,
+      gameplayStop: _pn,
+      commercialBreak: _pp,
+      rewardedBreak: function() { return Promise.resolve(true); },
+      displayAd: _pn,
+      destroyAd: _pn,
+      setDebug: _pn,
+      getURLParam: function() { return ""; },
+      shareableURL: function() { return Promise.resolve(""); },
+      isAdBlocked: function() { return false; },
+      gameLoadingStart: _pn,
+      gameLoadingFinished: _hideLoading,
+      gameLoadingProgress: _pn,
+      gameInteractive: _hideLoading,
+      customEvent: _pn,
+      happyTime: _pn,
+      logError: _pn,
+      roundStart: _pn,
+      roundEnd: _pn,
+      muteAd: _pn,
+      sendHighscore: _pn,
+      togglePlayerAdvertisingConsent: _pn,
+      disableDOMChangeObservation: _pn
+    };
+
+    console.log("[poki-dl] PokiSDK stub active");
+  `;
+
+  const domSafety = `
+    var _origGBI = Document.prototype.getElementById;
+    Document.prototype.getElementById = function(id) {
+      var el = _origGBI.call(this, id);
+      if (!el) {
+        el = document.createElement("div");
+        el.id = id;
+        el.style.display = "none";
+        el.dataset.pokiPlaceholder = "1";
+        if (document.body) document.body.appendChild(el);
+      }
+      return el;
+    };
+  `;
+
+  const onerrorSafety = `
+    (function() {
+      var _oeSetter = null;
+      Object.defineProperty(window, "onerror", {
+        configurable: true,
+        set: function(fn) { _oeSetter = fn; },
+        get: function() {
+          return function(msg, url, line, col, err) {
+            console.error("[poki-dl] onerror:", msg, url, line);
+            return true;
+          };
+        }
+      });
+    })();
+  `;
 
   return `<script>(function(){` +
+    onerrorSafety +
     sdkStub +
     domSafety +
     `var KH=${JSON.stringify(Array.from(knownHosts))};` +
@@ -745,9 +930,26 @@ function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
 }
 
 function neutralizePokiSdk(html) {
-  return html
+  html = html
     .replace(/<script[^>]*src="[^"]*poki-sdk-hoist[^"]*"[^>]*><\/script>/gi, "")
     .replace(/<script[^>]*src="[^"]*\/poki-sdk\.js"[^>]*><\/script>/gi, "");
+
+  html = stripPokiAdapterScript(html);
+  return html;
+}
+
+function stripPokiAdapterScript(html) {
+  const re = /<script>(?=[\s\S]{5000})([\s\S]*?)<\/script>/gi;
+  return html.replace(re, (match, content) => {
+    if (content.includes("_createForOfIteratorHelper") ||
+        content.includes("PokiSDK") ||
+        content.includes("poki-sdk") ||
+        content.includes("commercialBreak") ||
+        content.includes("rewardedBreak")) {
+      return "<!-- poki-adapter removed -->";
+    }
+    return match;
+  });
 }
 
 function removeDynamicLoaderContent(html, engine) {
@@ -951,7 +1153,13 @@ function buildStatusPayload() {
     gameName: activeSession.gameName,
     folder: activeSession.folder,
     stats: activeSession.stats,
-    fileCount: activeSession.files.length
+    fileCount: activeSession.files.length,
+    htmlStatus: {
+      gameHtml: activeSession.htmlCaptured.game,
+      indexHtml: activeSession.htmlCaptured.index,
+      networkCacheSize: networkHtmlCache.size,
+      debuggerAttached
+    }
   };
 }
 
@@ -1004,9 +1212,13 @@ async function restoreSession() {
     activeSession = {
       ...saved,
       seenUrls: new Set(saved.seenUrlsList || []),
-      pending: new Set(),
+      pending: new Set()
     };
     delete activeSession.seenUrlsList;
+
+    if (activeSession.tabId) {
+      void attachDebugger(activeSession.tabId);
+    }
 
     await chrome.action.setBadgeBackgroundColor({ tabId: activeSession.tabId, color: "#2563eb" });
     await updateBadgeCount();

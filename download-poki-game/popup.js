@@ -37,6 +37,11 @@ function renderStatus(result) {
   }
 
   const s = result.stats || {};
+  const h = result.htmlStatus || {};
+  const htmlLine = [
+    h.gameHtml ? "game.html ✓" : "game.html ✗",
+    h.indexHtml ? "index.html ✓" : "index.html ✗"
+  ].join("  ");
   const lines = [
     `状态: 监听中`,
     `游戏: ${result.gameName}`,
@@ -44,6 +49,8 @@ function renderStatus(result) {
     `失败: ${s.failed || 0}`,
     `总请求: ${s.totalSeen || 0}`,
     `文件数: ${result.fileCount || 0}`,
+    `HTML: ${htmlLine}`,
+    `网络缓存: ${h.networkCacheSize || 0} 条${h.debuggerAttached ? "" : " (调试器未连接!)"}`,
     `目录: ${result.folder}/`
   ];
   setStatus(lines.join("\n"));
@@ -112,7 +119,11 @@ captureBtn.addEventListener("click", async () => {
     if (!result) throw new Error("后台无响应。");
     if (!result.ok) throw new Error(result.error || "抓取失败。");
 
-    setStatus(`抓取成功！\n${result.message}`);
+    if (result.errors?.length) {
+      setStatus(`部分抓取成功:\n${result.message}`);
+    } else {
+      setStatus(`抓取成功！\n${result.message}`);
+    }
   } catch (error) {
     setStatus(`抓取失败: ${error.message}`);
   } finally {

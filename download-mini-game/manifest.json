@@ -5,6 +5,7 @@
   "description": "Download minigame.com game pages and core assets as local files.",
   "permissions": [
     "activeTab",
+    "debugger",
     "downloads",
     "scripting",
     "storage",
