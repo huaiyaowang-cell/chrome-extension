@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>下载 MiniGame 游戏</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        width: 320px;
+        padding: 14px;
+        color: #111827;
+      }
+
+      h1 {
+        font-size: 15px;
+        margin: 0 0 10px;
+      }
+
+      p {
+        margin: 0 0 12px;
+        font-size: 12px;
+        color: #4b5563;
+        line-height: 1.45;
+      }
+
+      button {
+        width: 100%;
+        border: 0;
+        border-radius: 8px;
+        padding: 10px 12px;
+        background: #10b981;
+        color: #fff;
+        font-size: 14px;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        background: #6ee7b7;
+        cursor: not-allowed;
+      }
+
+      .secondary {
+        margin-top: 8px;
+        background: #e5e7eb;
+        color: #111827;
+      }
+
+      .status {
+        margin-top: 10px;
+        min-height: 18px;
+        font-size: 12px;
+        color: #1f2937;
+        white-space: pre-wrap;
+      }
+
+      .hint {
+        margin-top: 10px;
+        font-size: 11px;
+        color: #6b7280;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>MiniGame 游戏下载器</h1>
+    <p>先开启监听，再刷新页面并进入游戏。<br/>游戏加载完成后，点击「抓取页面 HTML」。</p>
+    <button id="startBtn">开始监听当前标签页</button>
+    <button id="captureBtn" class="secondary" disabled>抓取页面 HTML（游戏加载后点）</button>
+    <button id="stopBtn" class="secondary" disabled>停止监听并写入清单</button>
+    <div id="status" class="status"></div>
+    <div class="hint">文件名路径前缀：download-mini-games/&lt;game-name&gt;/</div>
+    <script src="popup.js"></script>
+  </body>
+</html>

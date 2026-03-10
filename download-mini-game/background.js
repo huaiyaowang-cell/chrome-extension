@@ -1,22 +1,22 @@
-const OUTPUT_PREFIX = "downloaded-games";
+const OUTPUT_PREFIX = "download-mini-games";
 
 const GAME_DOMAIN_SUFFIXES = [
-  ".gdn.poki.com",
-  ".poki-gdn.com",
-  ".poki-cdn.com"
+  ".apps.minigame.vip"
 ];
 const GAME_DOMAIN_EXACT = [
-  "games.poki.com",
-  "game-cdn.poki.com",
-  "img.poki-cdn.com",
-  "a.poki-cdn.com"
+  "apps.minigame.vip"
+];
+const PAGE_HOSTS = [
+  "www.minigame.com",
+  "minigame.com"
 ];
 const TRACKER_KEYWORDS = [
   "google-analytics", "googletagmanager", "doubleclick",
   "googlesyndication", "adservice.", "sentry.io",
   "hotjar", "intercom", "facebook.net",
   "mixpanel", "segment.io", "amplitude",
-  "statsig", "branch.io", "adjust.com"
+  "statsig", "branch.io", "adjust.com",
+  "gtag/js"
 ];
 const GAME_EXTENSIONS = new Set([
   "js", "mjs", "css", "json", "wasm",
@@ -94,6 +94,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
+// --- Core logic ---
+
 async function startMonitor(tabId) {
   const pageInfo = await getPageInfoFromTab(tabId);
   if (!pageInfo?.pageUrl) {
@@ -106,11 +108,11 @@ async function startMonitor(tabId) {
   } catch {
     throw new Error("页面 URL 无法解析。");
   }
-  if (host !== "poki.com" && !host.endsWith(".poki.com")) {
-    throw new Error("请在 Poki 游戏页面开启监听。");
+  if (!PAGE_HOSTS.some((h) => host === h || host.endsWith("." + h))) {
+    throw new Error("请在 minigame.com 游戏页面开启监听。");
   }
 
-  const gameName = sanitizeName(pageInfo.gameName || "poki-game");
+  const gameName = sanitizeName(pageInfo.gameName || "mini-game");
   const folder = `${OUTPUT_PREFIX}/${gameName}`;
 
   activeSession = {
@@ -124,11 +126,11 @@ async function startMonitor(tabId) {
     pending: new Set(),
     stats: { totalSeen: 0, downloaded: 0, failed: 0, skipped: 0 },
     files: [],
-    htmlCaptured: { index: false, game: false }
+    htmlCaptured: { game: false }
   };
 
   await persistSession();
-  await chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: "#10b981" });
   await chrome.action.setBadgeText({ tabId, text: "ON" });
 
   return { gameName, folder, status: "listening" };
@@ -139,13 +141,11 @@ async function manualCaptureHtml(tabId) {
     throw new Error("当前没有监听会话。");
   }
 
-  activeSession.htmlCaptured.index = false;
   activeSession.htmlCaptured.game = false;
 
   await captureFrameHtml();
 
   const captured = [];
-  if (activeSession.htmlCaptured.index) captured.push("index.html");
   if (activeSession.htmlCaptured.game) captured.push("game.html");
 
   if (captured.length === 0) {
@@ -217,10 +217,6 @@ async function handleRequest(details) {
       activeSession.htmlCaptured.gameUrl = url;
     }
 
-    if (!activeSession.htmlCaptured.indexUrl && host !== "" && (host === "games.poki.com" || host.endsWith(".poki.com")) && !url.includes("/g/")) {
-      activeSession.htmlCaptured.indexUrl = url;
-    }
-
     scheduleCaptureFrameHtml();
     return;
   }
@@ -283,7 +279,8 @@ function isGameRelated(url, details) {
   }
 
   const lowerUrl = url.toLowerCase();
-  if (lowerUrl.includes("poki-sdk") || lowerUrl.includes("master-loader") || lowerUrl.includes("unity-2020") || lowerUrl.includes("unity-loader") || lowerUrl.includes("/loaders/")) {
+  if (lowerUrl.includes("minigame") || lowerUrl.includes("cocos2d") || lowerUrl.includes("cocos-js") ||
+      lowerUrl.includes("unity-2020") || lowerUrl.includes("unity-loader") || lowerUrl.includes("/loaders/")) {
     return true;
   }
 
@@ -331,6 +328,8 @@ function getCoreExtension(pathname) {
   return stripped.slice(dotIndex + 1).toLowerCase();
 }
 
+// --- HTML capture ---
+
 let captureFrameTimer = null;
 function scheduleCaptureFrameHtml() {
   clearTimeout(captureFrameTimer);
@@ -342,91 +341,61 @@ function scheduleCaptureFrameHtml() {
 
 async function captureFrameHtml() {
   if (!activeSession) return;
-  if (activeSession.htmlCaptured.index && activeSession.htmlCaptured.game) return;
+  if (activeSession.htmlCaptured.game) return;
 
   try {
     const allFrames = await chrome.webNavigation.getAllFrames({ tabId: activeSession.tabId });
     if (!allFrames || allFrames.length === 0) return;
 
-    let gameElementFrameId = -1;
-    let gameElementUrl = "";
-    let gameFrameFrameId = -1;
+    let gameFrameId = -1;
     let gameFrameUrl = activeSession.htmlCaptured.gameUrl || "";
 
     for (const frame of allFrames) {
       const url = frame.url || "";
       const host = safeHost(url);
 
-      if (frame.parentFrameId === 0 && frame.frameId !== 0 && host !== "" &&
-          (host === "games.poki.com" || host.endsWith(".poki.com")) && !url.includes("/g/")) {
-        gameElementFrameId = frame.frameId;
-        gameElementUrl = url;
-      }
-
       if (GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) {
-        gameFrameFrameId = frame.frameId;
+        gameFrameId = frame.frameId;
         if (!gameFrameUrl) gameFrameUrl = url;
+        break;
       }
     }
 
-    if (gameElementFrameId < 0) {
+    if (gameFrameId < 0) {
       for (const frame of allFrames) {
         if (frame.parentFrameId === 0 && frame.frameId !== 0) {
-          gameElementFrameId = frame.frameId;
-          gameElementUrl = frame.url;
-          break;
+          const url = frame.url || "";
+          if (url.startsWith("http")) {
+            gameFrameId = frame.frameId;
+            if (!gameFrameUrl) gameFrameUrl = url;
+            break;
+          }
         }
       }
     }
 
-    if (gameFrameFrameId < 0 && gameElementFrameId >= 0) {
-      for (const frame of allFrames) {
-        if (frame.parentFrameId === gameElementFrameId && frame.frameId !== gameElementFrameId) {
-          gameFrameFrameId = frame.frameId;
-          if (!gameFrameUrl) gameFrameUrl = frame.url;
-          break;
-        }
-      }
-    }
+    if (gameFrameId < 0) return;
 
     const engine = detectGameEngine();
     const gameFrameBaseUrl = getBaseUrl(gameFrameUrl);
     const specialMap = buildSpecialUrlMap(gameFrameUrl);
     const staleIds = getStaleElementIds(engine);
 
-    console.log(`[poki-dl] engine=${engine}, staleIds=[${staleIds}]`);
+    console.log(`[minigame-dl] engine=${engine}, staleIds=[${staleIds}]`);
 
-    if (!activeSession.htmlCaptured.game && gameFrameFrameId >= 0) {
-      let gameHtml = await getFrameHtmlWithFallback(activeSession.tabId, gameFrameFrameId, gameFrameUrl);
+    if (!activeSession.htmlCaptured.game) {
+      let gameHtml = await getFrameHtmlWithFallback(activeSession.tabId, gameFrameId, gameFrameUrl);
       if (gameHtml && gameHtml.length > 50) {
         const gameUrlMap = buildUrlToLocalMap();
         gameHtml = rewriteAllUrls(gameHtml, gameUrlMap);
         gameHtml = rewriteRemainingAbsoluteUrls(gameHtml, gameFrameBaseUrl);
-        gameHtml = neutralizePokiSdk(gameHtml);
+        gameHtml = neutralizeTrackers(gameHtml);
         gameHtml = removeDynamicLoaderContent(gameHtml, engine);
         gameHtml = removeStaleGameDom(gameHtml, staleIds);
         gameHtml = injectInterceptor(gameHtml, gameFrameBaseUrl, specialMap);
         await downloadText(`${activeSession.folder}/game.html`, gameHtml, "text/html;charset=utf-8");
         upsertFile({ type: "entry-html", sourceUrl: gameFrameUrl, localPath: "game.html", status: "ok" });
         activeSession.htmlCaptured.game = true;
-        activeSession.stats.downloaded += 1;
-      }
-    }
-
-    if (!activeSession.htmlCaptured.index && gameElementFrameId >= 0) {
-      let indexHtml = await getFrameHtmlWithFallback(activeSession.tabId, gameElementFrameId, gameElementUrl);
-      if (indexHtml && indexHtml.length > 50) {
-        if (gameFrameUrl) {
-          indexHtml = rewriteGameframeSrc(indexHtml, gameFrameUrl, "./game.html");
-        }
-        const indexUrlMap = buildUrlToLocalMap();
-        indexHtml = rewriteAllUrls(indexHtml, indexUrlMap);
-        indexHtml = rewriteRemainingAbsoluteUrls(indexHtml, "");
-        indexHtml = neutralizePokiSdk(indexHtml);
-        indexHtml = injectInterceptor(indexHtml, "", specialMap);
-        await downloadText(`${activeSession.folder}/index.html`, indexHtml, "text/html;charset=utf-8");
-        upsertFile({ type: "entry-html", sourceUrl: gameElementUrl, localPath: "index.html", status: "ok" });
-        activeSession.htmlCaptured.index = true;
         activeSession.stats.downloaded += 1;
       }
     }
@@ -459,7 +428,7 @@ async function getFrameHtmlWithFallback(tabId, frameId, frameUrl) {
 
     try {
       const resp = await fetch(frameUrl, {
-        headers: { "Referer": "https://games.poki.com/" }
+        headers: { "Referer": "https://www.minigame.com/" }
       });
       if (resp.ok) html = await resp.text();
     } catch {}
@@ -468,73 +437,13 @@ async function getFrameHtmlWithFallback(tabId, frameId, frameUrl) {
   return html || "";
 }
 
-function rewriteGameframeSrc(html, gameFrameUrl, localPath) {
-  const escaped = gameFrameUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  let result = html.replace(new RegExp(escaped, "g"), localPath);
-
-  const urlNoParams = gameFrameUrl.split("?")[0];
-  if (urlNoParams !== gameFrameUrl) {
-    const escapedBase = urlNoParams.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    result = result.replace(
-      new RegExp(`(<iframe[^>]*\\bid\\s*=\\s*["']gameframe["'][^>]*\\bsrc\\s*=\\s*["'])${escapedBase}[^"']*["']`, "i"),
-      `$1${localPath}"`
-    );
-  }
-
-  result = result.replace(
-    /(<iframe[^>]*\bid\s*=\s*["']gameframe["'][^>]*\bsrc\s*=\s*["'])https?:\/\/[^"']+?(["'])/i,
-    `$1${localPath}$2`
-  );
-
-  return result;
-}
+// --- URL rewriting ---
 
 function getBaseUrl(url) {
   if (!url) return "";
   const noQuery = url.split("?")[0];
   const lastSlash = noQuery.lastIndexOf("/");
   return lastSlash >= 0 ? noQuery.slice(0, lastSlash + 1) : noQuery + "/";
-}
-
-function detectGameEngine() {
-  if (!activeSession) return "unknown";
-  const paths = activeSession.files.map(f => (f.localPath || "").toLowerCase());
-  const urls = activeSession.files.map(f => (f.sourceUrl || "").toLowerCase());
-  const all = paths.concat(urls).join("\n");
-
-  if ((all.includes("/build/") || all.includes("\\build\\")) &&
-      (all.includes(".loader.js") || all.includes(".framework.js") || all.includes(".wasm"))) {
-    return "unity";
-  }
-  if (all.includes("dmloader") || all.includes(".arcd") || all.includes(".dmanifest")) return "defold";
-  if (all.includes("c3runtime") || all.includes("c2runtime")) return "construct";
-  if (all.includes(".pck") || all.includes("/godot")) return "godot";
-  if (all.includes("html5game/")) return "gamemaker";
-  if (all.includes("phaser")) return "phaser";
-  if (all.includes("pixi")) return "pixi";
-  if (all.includes("playcanvas")) return "playcanvas";
-  if (all.includes("createjs") || all.includes("easeljs")) return "createjs";
-  return "unknown";
-}
-
-function getStaleElementIds(engine) {
-  const BASE = ["loader", "game-container", "spinner", "loading"];
-  const ENGINE_IDS = {
-    unity: ["loader", "game-container", "spinner", "slideshow",
-            "progress-container", "progress-bar", "unity-container",
-            "unity-canvas", "unity-loading-bar", "unity-progress-bar-full"],
-    defold: ["loading-screen-container", "running-from-file-warning"],
-    construct: ["loading", "loader"],
-    godot: ["status", "status-progress", "status-notice"],
-    gamemaker: ["loader"],
-    phaser: [],
-    pixi: [],
-    playcanvas: ["application-splash-wrapper", "progress-bar", "progress"],
-    createjs: ["loader"]
-  };
-  const ids = new Set(BASE);
-  for (const id of (ENGINE_IDS[engine] || [])) ids.add(id);
-  return Array.from(ids);
 }
 
 function buildUrlToLocalMap() {
@@ -638,6 +547,119 @@ function buildSpecialUrlMap(gameFrameUrl) {
   return map;
 }
 
+// --- Game engine detection ---
+
+function detectGameEngine() {
+  if (!activeSession) return "unknown";
+  const paths = activeSession.files.map(f => (f.localPath || "").toLowerCase());
+  const urls = activeSession.files.map(f => (f.sourceUrl || "").toLowerCase());
+  const all = paths.concat(urls).join("\n");
+
+  if ((all.includes("/build/") || all.includes("\\build\\")) &&
+      (all.includes(".loader.js") || all.includes(".framework.js") || all.includes(".wasm"))) {
+    return "unity";
+  }
+  if (all.includes("dmloader") || all.includes(".arcd") || all.includes(".dmanifest")) return "defold";
+  if (all.includes("c3runtime") || all.includes("c2runtime")) return "construct";
+  if (all.includes(".pck") || all.includes("/godot")) return "godot";
+  if (all.includes("html5game/")) return "gamemaker";
+  if (all.includes("cocos2d") || all.includes("cocos-js") || all.includes("cc.game")) return "cocos";
+  if (all.includes("phaser")) return "phaser";
+  if (all.includes("pixi")) return "pixi";
+  if (all.includes("playcanvas")) return "playcanvas";
+  if (all.includes("createjs") || all.includes("easeljs")) return "createjs";
+  return "unknown";
+}
+
+function getStaleElementIds(engine) {
+  const BASE = ["loader", "game-container", "spinner", "loading"];
+  const ENGINE_IDS = {
+    unity: ["loader", "game-container", "spinner", "slideshow",
+            "progress-container", "progress-bar", "unity-container",
+            "unity-canvas", "unity-loading-bar", "unity-progress-bar-full"],
+    defold: ["loading-screen-container", "running-from-file-warning"],
+    construct: ["loading", "loader"],
+    godot: ["status", "status-progress", "status-notice"],
+    gamemaker: ["loader"],
+    cocos: [],
+    phaser: [],
+    pixi: [],
+    playcanvas: ["application-splash-wrapper", "progress-bar", "progress"],
+    createjs: ["loader"]
+  };
+  const ids = new Set(BASE);
+  for (const id of (ENGINE_IDS[engine] || [])) ids.add(id);
+  return Array.from(ids);
+}
+
+// --- HTML manipulation ---
+
+function neutralizeTrackers(html) {
+  html = html.replace(/<script[^>]*src="[^"]*googletagmanager[^"]*"[^>]*><\/script>/gi, "");
+  html = html.replace(/<script[^>]*src="[^"]*google-analytics[^"]*"[^>]*><\/script>/gi, "");
+  html = html.replace(/<script[^>]*src="[^"]*gtag\/js[^"]*"[^>]*><\/script>/gi, "");
+  html = html.replace(/<!--\s*<script[^>]*googletagmanager[^>]*>[\s\S]*?-->/gi, "");
+  return html;
+}
+
+function removeDynamicLoaderContent(html, engine) {
+  html = html.replace(/<!--\s*will\s+(be\s+copied|also\s+be\s+copied)\s+to\s+the\s+resulting\s+body\s*\/?\/?-->/gi, "");
+
+  if (engine === "construct") {
+    html = html.replace(/<script[^>]*src="[^"]*sw\.js"[^>]*><\/script>/gi, "");
+  }
+
+  if (engine === "godot") {
+    html = html.replace(/<script[^>]*src="[^"]*godot\.tools\.js"[^>]*><\/script>/gi, "");
+  }
+
+  return html;
+}
+
+function removeStaleGameDom(html, staleIds) {
+  for (const id of staleIds) {
+    let safety = 20;
+    while (safety-- > 0) {
+      const next = stripFirstDivById(html, id);
+      if (next === html) break;
+      html = next;
+    }
+  }
+  return html;
+}
+
+function stripFirstDivById(html, id) {
+  const marker = new RegExp(`<div\\b[^>]*\\bid\\s*=\\s*["']${id}["']`, "i");
+  const match = marker.exec(html);
+  if (!match) return html;
+
+  const start = match.index;
+  let depth = 0;
+  let i = start;
+
+  while (i < html.length) {
+    if (html[i] !== "<") { i++; continue; }
+    const chunk = html.slice(i, i + 6).toLowerCase();
+    if (chunk.startsWith("<div")) {
+      depth++;
+      i = html.indexOf(">", i);
+      if (i < 0) return html;
+      i++;
+    } else if (chunk.startsWith("</div")) {
+      depth--;
+      const end = html.indexOf(">", i);
+      if (end < 0) return html;
+      if (depth === 0) return html.slice(0, start) + html.slice(end + 1);
+      i = end + 1;
+    } else {
+      i++;
+    }
+  }
+  return html;
+}
+
+// --- Interceptor injection ---
+
 function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
   const knownHosts = new Set(GAME_DOMAIN_EXACT);
   if (activeSession) {
@@ -657,29 +679,16 @@ function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
     } catch {}
   }
 
-  const sdkStub =
-    `var _pn=function(){};var _pp=function(){return Promise.resolve()};` +
-    `window.PokiSDK={init:_pp,gameplayStart:_pn,gameplayStop:_pn,` +
-      `commercialBreak:_pp,rewardedBreak:function(){return Promise.resolve(!0)},` +
-      `displayAd:_pn,destroyAd:_pn,setDebug:_pn,` +
-      `getURLParam:function(){return""},shareableURL:function(){return Promise.resolve("")},` +
-      `isAdBlocked:function(){return!1},gameLoadingStart:_pn,gameLoadingFinished:_pn,` +
-      `gameLoadingProgress:_pn,gameInteractive:_pn,customEvent:_pn,happyTime:_pn,` +
-      `logError:_pn,roundStart:_pn,roundEnd:_pn,muteAd:_pn,` +
-      `sendHighscore:_pn,togglePlayerAdvertisingConsent:_pn,disableDOMChangeObservation:_pn};` +
-    `console.log("[poki-dl] PokiSDK stub active");`;
-
   const domSafety =
     `var _origGBI=Document.prototype.getElementById;` +
     `Document.prototype.getElementById=function(id){` +
       `var el=_origGBI.call(this,id);` +
       `if(!el){el=document.createElement("div");el.id=id;` +
-        `el.style.display="none";el.dataset.pokiPlaceholder="1";` +
+        `el.style.display="none";el.dataset.mgPlaceholder="1";` +
         `if(document.body)document.body.appendChild(el);}` +
       `return el;};`;
 
   return `<script>(function(){` +
-    sdkStub +
     domSafety +
     `var KH=${JSON.stringify(Array.from(knownHosts))};` +
     `var GH=${JSON.stringify(gameHost)};` +
@@ -688,8 +697,6 @@ function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
     `var PD=location.pathname.substring(0,location.pathname.lastIndexOf("/")+1);` +
     `function rw(u){` +
       `if(!u||u.startsWith("data:")||u.startsWith("blob:"))return u;` +
-      `if(u.includes("poki-sdk-core")||u.includes("poki-sdk-hoist"))` +
-        `return"data:text/javascript,console.log('[poki-dl] sdk blocked')";` +
       `try{var o=new URL(u,location.href);` +
         `if(o.protocol!=="http:"&&o.protocol!=="https:")return u;` +
         `if(o.host!==location.host){` +
@@ -740,81 +747,8 @@ function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
       `if(dT&&dT.set){var origTC=dT.set;Object.defineProperty(Node.prototype,"textContent",{` +
         `set:function(v){if(this.tagName==="STYLE"&&typeof v==="string")v=rwCss(v);` +
           `origTC.call(this,v);},get:dT.get,configurable:true});}}catch(e){}` +
-    `console.log("[poki-dl] interceptor active, knownHosts:",KH.length,"gameHost:",GH);` +
+    `console.log("[minigame-dl] interceptor active, knownHosts:",KH.length,"gameHost:",GH);` +
   `})();</script>`;
-}
-
-function neutralizePokiSdk(html) {
-  return html
-    .replace(/<script[^>]*src="[^"]*poki-sdk-hoist[^"]*"[^>]*><\/script>/gi, "")
-    .replace(/<script[^>]*src="[^"]*\/poki-sdk\.js"[^>]*><\/script>/gi, "");
-}
-
-function removeDynamicLoaderContent(html, engine) {
-  html = html.replace(/<script[^>]*src="[^"]*loaders\/v\d+\/(?!master-loader)[^"]*"[^>]*><\/script>/gi, "");
-  html = html.replace(/<!--\s*will\s+(be\s+copied|also\s+be\s+copied)\s+to\s+the\s+resulting\s+body\s*\/?\/?-->/gi, "");
-
-  if (engine === "construct") {
-    html = html.replace(/<script[^>]*src="[^"]*sw\.js"[^>]*><\/script>/gi, "");
-  }
-
-  if (engine === "godot") {
-    html = html.replace(/<script[^>]*src="[^"]*godot\.tools\.js"[^>]*><\/script>/gi, "");
-  }
-
-  return html;
-}
-
-function removeStaleGameDom(html, staleIds) {
-  for (const id of staleIds) {
-    let safety = 20;
-    while (safety-- > 0) {
-      const next = stripFirstDivById(html, id);
-      if (next === html) break;
-      html = next;
-    }
-  }
-  return html;
-}
-
-function isInsideScriptBlock(html, pos) {
-  const before = html.slice(0, pos);
-  const lastOpen = before.lastIndexOf("<script");
-  if (lastOpen < 0) return false;
-  const lastClose = before.lastIndexOf("</script");
-  return lastOpen > lastClose;
-}
-
-function stripFirstDivById(html, id) {
-  const marker = new RegExp(`<div\\b[^>]*\\bid\\s*=\\s*["']${id}["']`, "ig");
-  let match;
-  while ((match = marker.exec(html)) !== null) {
-    if (isInsideScriptBlock(html, match.index)) continue;
-
-    const start = match.index;
-    let depth = 0;
-    let i = start;
-
-    while (i < html.length) {
-      if (html[i] !== "<") { i++; continue; }
-      const chunk = html.slice(i, i + 6).toLowerCase();
-      if (chunk.startsWith("<div")) {
-        depth++;
-        i = html.indexOf(">", i);
-        if (i < 0) return html;
-        i++;
-      } else if (chunk.startsWith("</div")) {
-        depth--;
-        const end = html.indexOf(">", i);
-        if (end < 0) return html;
-        if (depth === 0) return html.slice(0, start) + html.slice(end + 1);
-        i = end + 1;
-      } else {
-        i++;
-      }
-    }
-  }
-  return html;
 }
 
 function injectInterceptor(html, gameFrameBaseUrl, specialMap) {
@@ -826,19 +760,23 @@ function injectInterceptor(html, gameFrameBaseUrl, specialMap) {
   return script + html;
 }
 
+// --- Page info extraction ---
+
 async function getPageInfoFromTab(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
-      const pathMatch = window.location.pathname.match(/\/g\/([^/?#]+)/);
+      const pathMatch = window.location.pathname.match(/\/game\/([^/?#]+)/);
       return {
         pageUrl: window.location.href,
-        gameName: pathMatch ? decodeURIComponent(pathMatch[1]) : document.title || "poki-game"
+        gameName: pathMatch ? decodeURIComponent(pathMatch[1]) : document.title || "mini-game"
       };
     }
   });
   return results?.[0]?.result || null;
 }
+
+// --- Path utilities ---
 
 function urlToLocalPath(urlString) {
   const url = new URL(urlString);
@@ -896,6 +834,8 @@ function safeHost(urlString) {
   try { return new URL(urlString).host; } catch { return ""; }
 }
 
+// --- Download helpers ---
+
 async function downloadUrl(url, filename) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
@@ -931,6 +871,8 @@ async function downloadText(filename, textContent, mimeType) {
     );
   });
 }
+
+// --- File / session management ---
 
 function upsertFile(record) {
   if (!activeSession) return;
@@ -1008,7 +950,7 @@ async function restoreSession() {
     };
     delete activeSession.seenUrlsList;
 
-    await chrome.action.setBadgeBackgroundColor({ tabId: activeSession.tabId, color: "#2563eb" });
+    await chrome.action.setBadgeBackgroundColor({ tabId: activeSession.tabId, color: "#10b981" });
     await updateBadgeCount();
   } catch {
     activeSession = null;

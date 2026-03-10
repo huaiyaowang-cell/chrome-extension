@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Download MiniGame",
+  "version": "1.0.0",
+  "description": "Download minigame.com game pages and core assets as local files.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting",
+    "storage",
+    "tabs",
+    "webNavigation",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
