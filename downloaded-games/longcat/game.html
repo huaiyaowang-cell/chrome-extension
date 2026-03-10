@@ -1,0 +1,180 @@
+<html lang="en-us"><head><script>(function(){var H={"games.poki.com":"assets/games.poki.com","img.poki-cdn.com":"assets/img.poki-cdn.com","a.poki-cdn.com":"assets/a.poki-cdn.com","948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com":"assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com","game-cdn.poki.com":"assets/game-cdn.poki.com","v.poki-cdn.com":"assets/v.poki-cdn.com","poki.com":"assets/poki.com"};var R={"webapp/cover.jpg":"./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/cover.jpg","webapp/source_min.js":"./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/source_min.js","webapp/fancade.css":"./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/fancade.css","webapp/index.js":"./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/index.js","webapp/baloo2.woff":"./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/baloo2.woff","webapp/index.data":"./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/index.data","index.html":"./game.html","webapp/index.wasm":"./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/index.wasm"};var PD=location.pathname.substring(0,location.pathname.lastIndexOf("/")+1);function rw(u){if(!u||u.startsWith("data:")||u.startsWith("blob:"))return u;try{var o=new URL(u,location.href);if(o.protocol!=="http:"&&o.protocol!=="https:")return u;if(o.host!==location.host){var p=H[o.host];if(p)return"./"+p+o.pathname;}else{var rel=o.pathname;if(rel.startsWith(PD))rel=rel.substring(PD.length);var lc=R[rel];if(lc)return lc;}}catch(e){}return u;}var F=window.fetch;window.fetch=function(i,o){if(typeof i==="string")i=rw(i);else if(i&&i.url){var n=rw(i.url);if(n!==i.url)i=new Request(n,i);}return F.call(this,i,o);};var X=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){var a=[].slice.call(arguments);if(typeof a[1]==="string")a[1]=rw(a[1]);return X.apply(this,a);};var SA=Element.prototype.setAttribute;Element.prototype.setAttribute=function(n,v){if((n==="src"||n==="href")&&typeof v==="string")v=rw(v);return SA.call(this,n,v);};try{var sd=Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,"src");if(sd&&sd.set)Object.defineProperty(HTMLScriptElement.prototype,"src",{set:function(v){sd.set.call(this,rw(v));},get:sd.get,configurable:true});}catch(e){}try{var id=Object.getOwnPropertyDescriptor(HTMLImageElement.prototype,"src");if(id&&id.set)Object.defineProperty(HTMLImageElement.prototype,"src",{set:function(v){id.set.call(this,rw(v));},get:id.get,configurable:true});}catch(e){}console.log("[poki-dl] interceptor active, hosts:",Object.keys(H).length,"relatives:",Object.keys(R).length);})();</script><meta charset="utf-8"><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><title>Longcat</title><meta name="description" content=""><meta name="google" content="notranslate"><meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no"><link rel="stylesheet" href="./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/fancade.css"><link rel="icon" href="webapp/favicon.ico"><script src="//game-cdn.poki.com/scripts/v2/poki-sdk.js"></script><script src="./assets/game-cdn.poki.com/scripts/75f7e8fe10c7d72648928c61c75e77b9e34d71c5/poki-sdk-hoist-75f7e8fe10c7d72648928c61c75e77b9e34d71c5.js" type="text/javascript" crossorigin="anonymous"></script><style>
+.m8FXBR {
+	overflow: hidden;
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	z-index: 99999;
+}
+
+.m8FXBR.t_E9eW {
+	position: fixed;
+}
+
+.nAM_hf {
+	background: #000;
+	backdrop-filter: blur(10px);
+
+	position: relative;
+	z-index: 1;
+	width: 100%;
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+
+	opacity: 0;
+	transition: opacity 0.5s ease-in-out;
+}
+
+.qmpUYt {
+	position: absolute;
+	width: 100%;
+	height: 100%;
+}
+
+.qmpUYt.qWB0AN {
+	position: absolute;
+	width: 100%;
+	height: 100%;
+	z-index: 99999;
+	cursor: pointer;
+}
+
+.aPwh82 {
+	position: absolute;
+	z-index: 9999;
+	top: 0;
+
+	padding-top: 10%;
+	width: 100%;
+	height: 100%;
+	text-align: center;
+	color: #FFF;
+
+	font: 700 15pt 'Arial', sans-serif;
+	font-weight: bold;
+	letter-spacing: 1px;
+	transition: 0.1s ease-in-out;
+	line-height: 1em;
+
+	display: none;
+}
+
+.qQtYdx {
+    background: rgba(0, 43, 80, 0.5);
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+	z-index: 11;
+}
+
+.PBq_cb {
+	cursor:pointer;
+	width: 100%;
+	height: 100%;
+	z-index: 10;
+}
+
+.PBq_cb:hover .qQtYdx {
+		background: rgba(0, 43, 80, 0.7);
+	}
+
+.o_W9J9 {
+	position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: 12;
+}
+
+.o_W9J9:before {
+		content: '';
+		position: absolute;
+		width: 100px;
+		height: 100px;
+		display: block;
+		border: 2px solid #fff;
+		border-radius: 50%;
+		-webkit-user-select: none;
+		   -moz-user-select: none;
+		        user-select: none;
+		background-color: rgba(0, 0, 0, 0.6);
+		transition: background-color 0.5s ease;
+		animation: 1s linear infinite vCajRE;
+		z-index: 12;
+	}
+
+.o_W9J9:after {
+		content: '';
+		position: absolute;
+		display: block;
+		box-sizing: border-box;
+		border-color: transparent transparent transparent #fff;
+		border-style: solid;
+		border-width: 26px 0 26px 40px;
+		pointer-events: none;
+		animation: 1s linear infinite vCajRE;
+		left: 6px;
+		z-index: 12;
+	}
+
+@keyframes vCajRE {
+	0% {
+		transform: translate(-50%, -50%) scale(0.95);
+	}
+	70% {
+		transform: translate(-50%, -50%) scale(1.1);
+	}
+	100% {
+		transform: translate(-50%, -50%) scale(0.95);
+	}
+}
+
+.mRoqOt {
+	background: #B8C7DD;
+	width: 100%;
+	height: 5px;
+	position: absolute;
+	bottom: 0;
+	z-index: 9999;
+}
+
+._p4ryH {
+	position:relative;
+	bottom:0px;
+	background: #009CFF;
+	height: 100%;
+	width: 0%;
+	transition: width 0.5s;
+	transition-timing-function: linear;
+}
+
+.LI2Nug {
+	bottom: 10px;
+	position: absolute;
+	left: 10px;
+	z-index: 9999;
+	color: #FFF;
+	font: 700 9pt 'Arial', sans-serif;
+	filter: drop-shadow(0 0 0.2rem black);
+}
+
+.pkttBY {
+	display: block;
+	pointer-events: auto;
+}
+
+.pkttBY .nAM_hf {
+		opacity: 1;
+	}
+
+.Q94dIO {
+	display: none;
+	pointer-events: none;
+}
+</style></head><body id="body"><div id="modal_parent"><div id="modal_content"><span id="modal_close_button">×</span><div id="store_link_modal_content" class="modal_inner"></div><div id="share_file_modal_content" class="modal_inner"></div></div></div><div id="canvas_border" class="emscripten_border" style="margin-top: 0px;"><div id="play_content" class="middle center" style="display: none;"><div class="edge"><div class="box"><div class="black"><img src="./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/cover.jpg" class="cover"><p class="title">Longcat</p><p class="author">Fancade</p></div></div></div><div id="progress_or_play"><progress id="progress" class="loading" value="72" max="100"></progress></div><p class="description"></p></div><canvas class="emscripten" id="canvas" tabindex="-1" width="1170" height="2340" style="border-radius: 0px; width: 390px; height: 780px;"></canvas><div id="gradient" style="left: 0px; width: 390px; height: 780px; border-radius: 0px; display: none;"></div><div id="webview_content" style="left: 0px; width: 390px; height: 780px; border-radius: 0px;"></div></div><script type="text/javascript" src="./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/source_min.js" crossorigin="anonymous"></script><script type="text/javascript" src="./assets/948d3db9-a37d-4625-88aa-40c92f815ef7.gdn.poki.com/71252e46-070a-491d-87b8-7d32af29eb9b/webapp/index.js" crossorigin="anonymous"></script></body></html>

@@ -1,0 +1,28 @@
+{
+  "gameName": "happy-glass",
+  "pageUrl": "https://poki.com/zh/g/happy-glass#fullscreen",
+  "engine": "unknown",
+  "startedAt": "2026-03-10T06:38:12.723Z",
+  "stoppedAt": "2026-03-10T06:38:18.727Z",
+  "status": "stopped",
+  "stats": {
+    "totalSeen": 10,
+    "downloaded": 2,
+    "failed": 0,
+    "skipped": 10
+  },
+  "files": [
+    {
+      "type": "entry-html",
+      "sourceUrl": "https://5cac4523-71ea-476e-8acc-a6cb9c25cc06.gdn.poki.com/d30b371c-de2c-47b1-bb2f-4324f6395542/index.html?country=SG&ccpaApplies=0&url_referrer=https%3A%2F%2Fpoki.com%2F&tag=pg-9e6084c9b19f971e704716332dd6e32d602a2197&site_id=73&iso_lang=zh&poki_url=https%3A%2F%2Fpoki.com%2Fzh%2Fg%2Fhappy-glass&hoist=yes&nonPersonalized=n&cloudsavegames=n&familyFriendly=n&categories=7%2C34%2C72%2C400%2C1013%2C1190&special_condition=landing&game_id=5cac4523-71ea-476e-8acc-a6cb9c25cc06&game_version_id=d30b371c-de2c-47b1-bb2f-4324f6395542&inspector=0&csp=1",
+      "localPath": "game.html",
+      "status": "ok"
+    },
+    {
+      "type": "entry-html",
+      "sourceUrl": "https://games.poki.com/458768/5cac4523-71ea-476e-8acc-a6cb9c25cc06?tag=pg-9e6084c9b19f971e704716332dd6e32d602a2197&site_id=73&iso_lang=zh&country=SG&poki_url=https://poki.com/zh/g/happy-glass&hoist=yes&nonPersonalized=n&cloudsavegames=n&familyFriendly=n&categories=7,34,72,400,1013,1190&special_condition=landing&user_id=aa-tcsc91tJ2Jg2FUQpBaQ",
+      "localPath": "index.html",
+      "status": "ok"
+    }
+  ]
+}

@@ -1,0 +1,682 @@
+<html><head><script>(function(){var _pn=function(){};var _pp=function(){return Promise.resolve()};window.PokiSDK={init:_pp,gameplayStart:_pn,gameplayStop:_pn,commercialBreak:_pp,rewardedBreak:function(){return Promise.resolve(!0)},displayAd:_pn,destroyAd:_pn,setDebug:_pn,getURLParam:function(){return""},shareableURL:function(){return Promise.resolve("")},isAdBlocked:function(){return!1},gameLoadingStart:_pn,gameLoadingFinished:_pn,gameLoadingProgress:_pn,gameInteractive:_pn,customEvent:_pn,happyTime:_pn,logError:_pn,roundStart:_pn,roundEnd:_pn,muteAd:_pn,sendHighscore:_pn,togglePlayerAdvertisingConsent:_pn,disableDOMChangeObservation:_pn};console.log("[poki-dl] PokiSDK stub active");var H={"games.poki.com":"assets/games.poki.com","game-cdn.poki.com":"assets/game-cdn.poki.com","img.poki-cdn.com":"assets/img.poki-cdn.com","a.poki-cdn.com":"assets/a.poki-cdn.com"};var R={};var S={"5cac4523-71ea-476e-8acc-a6cb9c25cc06.gdn.poki.com/d30b371c-de2c-47b1-bb2f-4324f6395542/index.html":"./game.html"};var GP="./assets/5cac4523-71ea-476e-8acc-a6cb9c25cc06.gdn.poki.com/d30b371c-de2c-47b1-bb2f-4324f6395542/";var GRP=[];var PD=location.pathname.substring(0,location.pathname.lastIndexOf("/")+1);function rw(u){if(!u||u.startsWith("data:")||u.startsWith("blob:"))return u;if(u.includes("poki-sdk-core")||u.includes("poki-sdk-hoist"))return"data:text/javascript,console.log('[poki-dl] sdk blocked')";try{var o=new URL(u,location.href);if(o.protocol!=="http:"&&o.protocol!=="https:")return u;if(o.host!==location.host){var sk=o.host+o.pathname;if(S[sk])return S[sk];var p=H[o.host];if(p)return"./"+p+o.pathname;}else{var rel=o.pathname;if(rel.startsWith(PD))rel=rel.substring(PD.length);var lc=R[rel];if(lc)return lc;if(GP){for(var gi=0;gi<GRP.length;gi++){if(rel.startsWith(GRP[gi]))return GP+rel;}}}}catch(e){}return u;}var F=window.fetch;window.fetch=function(i,o){if(typeof i==="string")i=rw(i);else if(i&&i.url){var n=rw(i.url);if(n!==i.url)i=new Request(n,i);}return F.call(this,i,o);};var X=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){var a=[].slice.call(arguments);if(typeof a[1]==="string")a[1]=rw(a[1]);return X.apply(this,a);};var SA=Element.prototype.setAttribute;Element.prototype.setAttribute=function(n,v){if((n==="src"||n==="href")&&typeof v==="string")v=rw(v);return SA.call(this,n,v);};function patchSrc(P){try{var d=Object.getOwnPropertyDescriptor(P,"src");if(d&&d.set)Object.defineProperty(P,"src",{set:function(v){d.set.call(this,rw(v));},get:d.get,configurable:true});}catch(e){}}patchSrc(HTMLScriptElement.prototype);patchSrc(HTMLImageElement.prototype);patchSrc(HTMLIFrameElement.prototype);patchSrc(HTMLSourceElement.prototype);patchSrc(HTMLMediaElement.prototype);console.log("[poki-dl] interceptor active, hosts:",Object.keys(H).length,"relatives:",Object.keys(R).length,"specials:",Object.keys(S).length,"gamePrefix:",GP);})();</script>
+	<meta charset="utf-8">
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+	<title>Happy Glass - Poki</title>
+	<script>
+	window.config = {
+		loader: 'unity-2020',
+		debug: false,
+		maxRatio: 24 / 9,
+		minRatio: 9 / 24,
+
+		title: 'Happy Glass',
+		thumbnail: '.\/assets\/img.poki-cdn.com\/649f916152c6defac7c09dbaf29f74e9.jfif',
+		numScreenshots:  4 ,
+
+		unityVersion: '2021.3.45f1',
+		unityWebglBuildUrl: '',
+
+		fileSize:  12 ,
+		cachedDecompressedFileSizes: {
+			'2034c3a3f31fb182d5dab076c578d580.framework.js.br':  76997 ,
+			'95d6764c749dfc845fdc8176ba7206d7.data.br':  6509688 ,
+			'a4ab965b7735e46ca3f22b32204cb8c5.wasm.br':  5509867 ,
+			'e40682cd4a2e8826aa72fb3216daf773.loader.js':  5988 ,
+		},
+		"metadata": {"poki_template_version":1,"background_color":"#000000","code_filename":"a4ab965b7735e46ca3f22b32204cb8c5.wasm.br","company_name":"Game5mobile","data_filename":"95d6764c749dfc845fdc8176ba7206d7.data.br","development_player":"false","framework_filename":"2034c3a3f31fb182d5dab076c578d580.framework.js.br","height":"600","loader_filename":"e40682cd4a2e8826aa72fb3216daf773.loader.js","product_name":"Happy Glass","product_version":"1.2.4","splash_screen_style":"Dark","unity_version":"2021.3.45f1","use_data_caching":"true","use_threads":"false","use_wasm":"true","use_webgl_1_0":"true","use_webgl_2_0":"true","width":"960"}
+	};
+	</script>
+<!-- will be copied to the resulting head //-->
+<style>* {
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #002B50;
+    font-family: Torus, Arial, Helvetica, sans-serif;
+    color: #fff;
+}
+
+#game-container {
+    position: absolute !important;
+    left: 50%;
+    top: 50%;
+    display: none;
+}
+
+#game,
+#game canvas {
+    width: 100%;
+    height: 100%;
+}
+
+#loader {
+    width: 100%;
+    height: 100%;
+}
+
+/**
+   * Slideshow
+   */
+
+#slideshow {
+    width: 100%;
+    height: 100%;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-evenly;
+    display: flex;
+    user-select: none;
+}
+
+@font-face {
+    font-family: Torus;
+    src:
+        url('//a.poki-cdn.com/fonts/torus-bold-webfont.woff2') format('woff2'),
+        url('//a.poki-cdn.com/fonts/torus-bold-webfont.woff') format('woff');
+    font-style: bold;
+    font-weight: 700;
+}
+
+/**
+   * Slideshow - Top section
+   */
+#progress-spinner{
+    margin-left: 0;
+    margin-top: 0;
+    left: 0px;
+    display:none;
+    transform: translate(100%, -50%);
+    width:10vh;
+}
+#progress-spinner >div{
+    width:2vh;
+    height:2vh;
+}
+#thumbnail {
+    box-shadow: 0 1vh 2vh rgba(0, 0, 0, 0.4);
+    /* box-shadow: 0 6px 12px rgba(0, 0, 0, 0.24); */
+    border-radius: 16.667%;
+}
+
+#slideshow-top {
+    display: flex;
+    margin: 2.5vh 0;
+}
+
+#slideshow-top-container {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    flex-grow: 1;
+}
+
+#game-title, #progress-comment {
+    display: flex;
+    flex-grow: 1;
+    align-items: center;
+    font-size:2vh;
+}
+
+#progress-container {
+    display: flex;
+    align-items: center;
+    flex-grow: 1;
+    transition: 0.2s ease-out all;
+}
+
+#progress-container.done {
+    opacity: 0;
+}
+
+#progress-bar {
+    background: #fff;
+    width: 100%;
+    overflow: hidden;
+}
+
+#progress-fill {
+    background: #3CF7DC;
+    height: 100%;
+    transition: 0.2s ease-out all;
+    animation-name: fillColor;
+    animation-duration: 3.5s;
+    animation-iteration-count: infinite;
+    animation-fill-mode: both;
+}
+
+@keyframes fillColor {
+    0% {
+        background-color: #3CF7DC;
+    }
+
+    25% {
+        background-color: #FFA9BE;
+    }
+
+    50% {
+        background-color: #FFDC00;
+    }
+
+    75% {
+        background-color: #E0AEF5;
+    }
+
+    100% {
+        background-color: #3CF7DC;
+    }
+}
+
+@media (orientation: portrait) {
+    #thumbnail {
+        margin-right: 2.4vh;
+    }
+
+    #game-title h1 {
+        font-size: 2vh;
+    }
+
+    #slideshow-top {
+        width: 70vw;
+    }
+
+    #progress-bar {
+        height: 1vh;
+        border-radius: 0.5vh;
+    }
+
+    #progress-fill {
+        border-radius: 0.5vh;
+    }
+
+    #thumbnail {
+        width: 5vh;
+        height: 5vh;
+    }
+
+    #progress-amount {
+        font-size: 2vh;
+        margin-left: 1.5vh;
+        width: 3vh;
+    }
+}
+
+@media (orientation: landscape) {
+    #thumbnail {
+        margin-right: 3vh;
+    }
+
+    #game-title h1 {
+        font-size: 3vh;
+    }
+
+    #slideshow-top {
+        width: 50vw;
+    }
+
+    #progress-bar {
+        height: 1.2vh;
+        border-radius: 0.6vh;
+    }
+
+    #progress-fill {
+        border-radius: 0.6vh;
+    }
+
+    #thumbnail {
+        width: 7.5vh;
+        height: 7.5vh;
+    }
+
+    #progress-amount {
+        font-size: 2.5vh;
+        margin-left: 1.875vh;
+        width: 3.75vh;
+    }
+}
+
+/**
+   * Slideshow - Images section
+   */
+
+#slideshow-images {
+    width: 100vw;
+    display: flex;
+    justify-content: center;
+}
+
+#slideshow-images .image {
+    position: absolute;
+    box-shadow: 0 2.4vh 3.6vh rgba(0, 0, 0, 0.4);
+    transition-property: transform;
+    transition-timing-function: ease-in-out;
+    perspective: 1000px;
+    left: 0;
+    overflow: hidden;
+    /* border: 1vh solid; */
+}
+
+#slideshow-images .image img {
+    width: 100%;
+    height: 100%;
+}
+
+#slideshow-images .image:nth-of-type(1n) {
+    border-color: #3BE8B0;
+}
+
+#slideshow-images .image:nth-of-type(2n) {
+    border-color: #FF6D92;
+}
+
+#slideshow-images .image:nth-of-type(3n) {
+    border-color: #A177FF;
+}
+
+#slideshow-images .image:nth-of-type(4n) {
+    border-color: #FFD200;
+}
+
+#slideshow-images .left {
+    z-index: 2;
+}
+#slideshow-images .right {
+    z-index: 1;
+}
+
+#slideshow-images .middle {
+    z-index: 3;
+}
+
+#slideshow-images .left img,
+#slideshow-images .right img {
+    transform: scale(1.05);
+}
+
+#slideshow-images .left img,
+#slideshow-images .right img,
+#slideshow-images .fromLeft img,
+#slideshow-images .fromRight img {
+    filter: blur(1vh);
+}
+
+#slideshow-images .inactive {
+    display: none;
+}
+
+#slideshow-images .inactive.fromLeft,
+#slideshow-images .inactive.fromRight {
+    display: block;
+}
+
+/**
+   * Slideshow - Navigation section
+   */
+
+#slideshow-nav {
+    display: flex;
+    justify-content: center;
+    margin: 2.5vh 0;
+}
+
+#slideshow-nav .bullet {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+#slideshow-nav .bullet:after {
+    content: '';
+    background: #fff;
+    border-radius: 0.4vh;
+    width: 0.8vh;
+    height: 0.8vh;
+}
+
+#slideshow-nav .bullet.active:after {
+    background: #009CFF;
+}
+
+#slideshow-nav .bullet {
+    width: 2.5vh;
+    height: 2.5vh;
+}
+
+#slideshow-nav .bullet:after {
+    border-radius: 50%;
+    width: 50%;
+    height: 50%;
+}
+
+/**
+   * Pop-in animation
+   */
+
+#slideshow-nav,
+#slideshow-images {
+    opacity: 0;
+    transition: 0.4s all ease-out;
+    transform: translateY(2vh);
+    perspective: 1000px;
+    transition-delay: 400ms;
+}
+
+#slideshow-nav {
+    transition-delay: 600ms;
+}
+
+#slideshow.active #slideshow-images,
+#slideshow.active #slideshow-nav {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+@keyframes bounceInDown {
+
+    from,
+    60%,
+    75%,
+    90%,
+    to {
+        animation-timing-function: cubic-bezier(0.215, 0.610, 0.355, 1.000);
+    }
+
+    0% {
+        transform: translate3d(0, -100vh, 0);
+    }
+
+    40% {
+        transform: translate3d(0, 0.5vh, 0);
+    }
+
+    65% {
+        transform: translate3d(0, -0.2vh, 0);
+    }
+
+    80% {
+        transform: translate3d(0, 0.1vh, 0);
+    }
+
+    to {
+        transform: translate3d(0, 0, 0);
+    }
+}
+
+#slideshow-top {
+    transform: translate3d(0, -20vh, 0);
+    opacity: 0;
+}
+
+#slideshow-top.active {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+    animation-name: bounceInDown;
+    animation-duration: 0.5s;
+}
+
+/**
+   * Loading dots
+   */
+.spinner {
+    position: relative;
+    left: -9999px;
+    animation: dot-pulse 1.5s infinite linear;
+    animation-delay: .25s;
+    transform:translate(50vw, 50vh) translate(-130%, -130%);
+  }
+
+  .spinner:before, .spinner:after {
+    content: '';
+    display: inline-block;
+    position: absolute;
+    top: 0;
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+  }
+  .spinner, .spinner:before, .spinner:after{
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+  }
+
+  .spinner:before {
+    animation: dot-pulse 1.5s infinite linear;
+    animation-delay: 0s;
+    left:-20px;
+  }
+
+  .spinner:after {
+    animation: dot-pulse 1.5s infinite linear;
+    animation-delay: .5s;
+    left:20px;
+  }
+
+  @keyframes dot-pulse {
+    0% {
+      box-shadow: 9999px 0 0 -5px #FFF;
+    }
+    30% {
+      box-shadow: 9999px 0 0 2px #FFF;
+    }
+    60%,
+    100% {
+      box-shadow: 9999px 0 0 -5px #FFF;
+    }
+  }
+</style><style>
+.m8FXBR {
+	overflow: hidden;
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	z-index: 99999;
+}
+
+.m8FXBR.t_E9eW {
+	position: fixed;
+}
+
+.nAM_hf {
+	background: #000;
+	backdrop-filter: blur(10px);
+
+	position: relative;
+	z-index: 1;
+	width: 100%;
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+
+	opacity: 0;
+	transition: opacity 0.5s ease-in-out;
+}
+
+.qmpUYt {
+	position: absolute;
+	width: 100%;
+	height: 100%;
+}
+
+.qmpUYt.qWB0AN {
+	position: absolute;
+	width: 100%;
+	height: 100%;
+	z-index: 99999;
+	cursor: pointer;
+}
+
+.aPwh82 {
+	position: absolute;
+	z-index: 9999;
+	top: 0;
+
+	padding-top: 10%;
+	width: 100%;
+	height: 100%;
+	text-align: center;
+	color: #FFF;
+
+	font: 700 15pt 'Arial', sans-serif;
+	font-weight: bold;
+	letter-spacing: 1px;
+	transition: 0.1s ease-in-out;
+	line-height: 1em;
+
+	display: none;
+}
+
+.qQtYdx {
+    background: rgba(0, 43, 80, 0.5);
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+	z-index: 11;
+}
+
+.PBq_cb {
+	cursor:pointer;
+	width: 100%;
+	height: 100%;
+	z-index: 10;
+}
+
+.PBq_cb:hover .qQtYdx {
+		background: rgba(0, 43, 80, 0.7);
+	}
+
+.o_W9J9 {
+	position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: 12;
+}
+
+.o_W9J9:before {
+		content: '';
+		position: absolute;
+		width: 100px;
+		height: 100px;
+		display: block;
+		border: 2px solid #fff;
+		border-radius: 50%;
+		-webkit-user-select: none;
+		   -moz-user-select: none;
+		        user-select: none;
+		background-color: rgba(0, 0, 0, 0.6);
+		transition: background-color 0.5s ease;
+		animation: 1s linear infinite vCajRE;
+		z-index: 12;
+	}
+
+.o_W9J9:after {
+		content: '';
+		position: absolute;
+		display: block;
+		box-sizing: border-box;
+		border-color: transparent transparent transparent #fff;
+		border-style: solid;
+		border-width: 26px 0 26px 40px;
+		pointer-events: none;
+		animation: 1s linear infinite vCajRE;
+		left: 6px;
+		z-index: 12;
+	}
+
+@keyframes vCajRE {
+	0% {
+		transform: translate(-50%, -50%) scale(0.95);
+	}
+	70% {
+		transform: translate(-50%, -50%) scale(1.1);
+	}
+	100% {
+		transform: translate(-50%, -50%) scale(0.95);
+	}
+}
+
+.mRoqOt {
+	background: #B8C7DD;
+	width: 100%;
+	height: 5px;
+	position: absolute;
+	bottom: 0;
+	z-index: 9999;
+}
+
+._p4ryH {
+	position:relative;
+	bottom:0px;
+	background: #009CFF;
+	height: 100%;
+	width: 0%;
+	transition: width 0.5s;
+	transition-timing-function: linear;
+}
+
+.LI2Nug {
+	bottom: 10px;
+	position: absolute;
+	left: 10px;
+	z-index: 9999;
+	color: #FFF;
+	font: 700 9pt 'Arial', sans-serif;
+	filter: drop-shadow(0 0 0.2rem black);
+}
+
+.pkttBY {
+	display: block;
+	pointer-events: auto;
+}
+
+.pkttBY .nAM_hf {
+		opacity: 1;
+	}
+
+.Q94dIO {
+	display: none;
+	pointer-events: none;
+}
+</style></head>
+<body>
+	<script src="./assets/game-cdn.poki.com/loaders/v3/master-loader.js"></script>
+
+
+
+
+<script src="Build/e40682cd4a2e8826aa72fb3216daf773.loader.js"></script><style>
+		#slideshow-images {
+			height: 16.799999999999997vh;
+		}
+		#slideshow-images .image {
+			transition-duration: 0.5s;
+			width: 60vw;
+			height: 16.799999999999997vh;
+		}
+		#slideshow-images .middle {
+			transform: translateX(20vw);
+		}
+		#slideshow-images .left {
+			transform: translateX(-34vw) scale(0.8);
+		}
+		#slideshow-images .right {
+			transform: translateX(74vw) scale(0.8);
+		}
+		#slideshow-images .inactive.fromLeft {
+			transform: translateX(-60vw) scale(0.4);
+		}
+		#slideshow-images .inactive.fromRight {
+			transform: translateX(130vw) scale(0.4);
+		}
+	</style><script src="Build/2034c3a3f31fb182d5dab076c578d580.framework.js.br"></script></body></html>
