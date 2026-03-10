@@ -390,35 +390,22 @@ async function captureFrameHtml() {
     }
 
     const engine = detectGameEngine();
-    const hostMap = buildHostMap();
     const gameFrameBaseUrl = getBaseUrl(gameFrameUrl);
-    const gameRelativeMap = buildRelativeMap(gameFrameBaseUrl);
     const specialMap = buildSpecialUrlMap(gameFrameUrl);
-    const relPrefixes = extractRelativePrefixes(gameFrameBaseUrl);
     const staleIds = getStaleElementIds(engine);
 
-    let gameAssetPrefix = "";
-    if (gameFrameBaseUrl) {
-      try {
-        const gfUrl = new URL(gameFrameBaseUrl);
-        const dir = gfUrl.pathname.substring(0, gfUrl.pathname.lastIndexOf("/") + 1);
-        gameAssetPrefix = "./assets/" + sanitizeName(gfUrl.host) + dir;
-      } catch {}
-    }
-
-    console.log(`[poki-dl] engine=${engine}, relPrefixes=[${relPrefixes}], staleIds=[${staleIds}]`);
+    console.log(`[poki-dl] engine=${engine}, staleIds=[${staleIds}]`);
 
     if (!activeSession.htmlCaptured.game && gameFrameFrameId >= 0) {
       let gameHtml = await getFrameHtmlWithFallback(activeSession.tabId, gameFrameFrameId, gameFrameUrl);
       if (gameHtml && gameHtml.length > 50) {
-        const gameUrlMap = buildUrlToLocalMap(gameFrameBaseUrl);
+        const gameUrlMap = buildUrlToLocalMap();
         gameHtml = rewriteAllUrls(gameHtml, gameUrlMap);
-        gameHtml = rewriteRemainingGameUrls(gameHtml, hostMap, gameFrameBaseUrl, relPrefixes);
+        gameHtml = rewriteRemainingAbsoluteUrls(gameHtml, gameFrameBaseUrl);
         gameHtml = neutralizePokiSdk(gameHtml);
         gameHtml = removeDynamicLoaderContent(gameHtml, engine);
         gameHtml = removeStaleGameDom(gameHtml, staleIds);
-        gameHtml = rewriteAllRelativeGameUrls(gameHtml, gameAssetPrefix);
-        gameHtml = injectInterceptor(gameHtml, hostMap, gameRelativeMap, specialMap, gameAssetPrefix, relPrefixes);
+        gameHtml = injectInterceptor(gameHtml, gameFrameBaseUrl, specialMap);
         await downloadText(`${activeSession.folder}/game.html`, gameHtml, "text/html;charset=utf-8");
         upsertFile({ type: "entry-html", sourceUrl: gameFrameUrl, localPath: "game.html", status: "ok" });
         activeSession.htmlCaptured.game = true;
@@ -432,11 +419,11 @@ async function captureFrameHtml() {
         if (gameFrameUrl) {
           indexHtml = rewriteGameframeSrc(indexHtml, gameFrameUrl, "./game.html");
         }
-        const indexUrlMap = buildUrlToLocalMap("");
+        const indexUrlMap = buildUrlToLocalMap();
         indexHtml = rewriteAllUrls(indexHtml, indexUrlMap);
-        indexHtml = rewriteRemainingGameUrls(indexHtml, hostMap, "", []);
+        indexHtml = rewriteRemainingAbsoluteUrls(indexHtml, "");
         indexHtml = neutralizePokiSdk(indexHtml);
-        indexHtml = injectInterceptor(indexHtml, hostMap, {}, specialMap, "", []);
+        indexHtml = injectInterceptor(indexHtml, "", specialMap);
         await downloadText(`${activeSession.folder}/index.html`, indexHtml, "text/html;charset=utf-8");
         upsertFile({ type: "entry-html", sourceUrl: gameElementUrl, localPath: "index.html", status: "ok" });
         activeSession.htmlCaptured.index = true;
@@ -529,23 +516,6 @@ function detectGameEngine() {
   return "unknown";
 }
 
-function extractRelativePrefixes(gameFrameBaseUrl) {
-  const prefixes = new Set();
-  if (!activeSession || !gameFrameBaseUrl) return [];
-  for (const file of activeSession.files) {
-    if (file.status !== "ok" || !file.sourceUrl) continue;
-    const noQuery = file.sourceUrl.split("?")[0];
-    if (noQuery.startsWith(gameFrameBaseUrl)) {
-      const rel = noQuery.slice(gameFrameBaseUrl.length);
-      const slash = rel.indexOf("/");
-      if (slash > 0) {
-        prefixes.add(rel.slice(0, slash + 1));
-      }
-    }
-  }
-  return Array.from(prefixes);
-}
-
 function getStaleElementIds(engine) {
   const BASE = ["loader", "game-container", "spinner", "loading"];
   const ENGINE_IDS = {
@@ -565,7 +535,7 @@ function getStaleElementIds(engine) {
   return Array.from(ids);
 }
 
-function buildUrlToLocalMap(frameBaseUrl) {
+function buildUrlToLocalMap() {
   const map = new Map();
   if (!activeSession) return map;
   for (const file of activeSession.files) {
@@ -575,12 +545,6 @@ function buildUrlToLocalMap(frameBaseUrl) {
     const noQuery = file.sourceUrl.split("?")[0];
     if (noQuery !== file.sourceUrl && !map.has(noQuery)) {
       map.set(noQuery, localRef);
-    }
-    if (frameBaseUrl && noQuery.startsWith(frameBaseUrl)) {
-      const rel = noQuery.slice(frameBaseUrl.length);
-      if (rel && !rel.startsWith("http") && !map.has(rel)) {
-        map.set(rel, localRef);
-      }
     }
   }
   return map;
@@ -616,94 +580,50 @@ function rewriteAllUrls(html, urlToLocal) {
   return result;
 }
 
-function rewriteRemainingGameUrls(html, hostMap, gameFrameBaseUrl, relPrefixes) {
-  for (const [host, prefix] of Object.entries(hostMap)) {
-    for (const proto of ["https://", "http://"]) {
-      const origin = proto + host + "/";
-      if (html.includes(origin)) {
-        html = html.split(origin).join("./" + prefix + "/");
-      }
-      const esc = origin.replace(/\//g, "\\/");
-      if (html.includes(esc)) {
-        html = html.split(esc).join(("./" + prefix + "/").replace(/\//g, "\\/"));
-      }
-    }
-  }
-
-  if (gameFrameBaseUrl && relPrefixes && relPrefixes.length > 0) {
-    try {
-      const u = new URL(gameFrameBaseUrl);
-      const dir = u.pathname.substring(0, u.pathname.lastIndexOf("/") + 1);
-      const localBase = "./assets/" + sanitizeName(u.host) + dir;
-      for (const rp of relPrefixes) {
-        const safeRp = rp.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const re = new RegExp(`(["'])${safeRp}`, "g");
-        html = html.replace(re, (m, q) => q + localBase + rp);
-      }
-    } catch {}
-  }
-
-  return html;
-}
-
-function rewriteAllRelativeGameUrls(html, gameAssetPrefix) {
-  if (!gameAssetPrefix) return html;
-  const skip = /^(?:data:|blob:|https?:|\/\/|\.\/|\.\.\/|javascript:|#|$)/i;
-  const assetExt = /\.(?:js|css|json|wasm|data|png|jpe?g|gif|svg|webp|ico|bmp|avif|mp3|ogg|wav|m4a|aac|webm|mp4|ttf|otf|woff2?|eot|bin|bundle|atlas|fnt|xml|pck|glb|gltf|spine|skel|mem|unityweb)(?:[?#]|$)/i;
-
-  html = html.replace(
-    /url\(\s*(["']?)([^"')]+?)\1\s*\)/gi,
-    (match, q, path) => {
-      path = path.trim();
-      if (skip.test(path)) return match;
-      return `url(${q}${gameAssetPrefix}${path}${q})`;
-    }
-  );
-
-  html = html.replace(
-    /((?:src|href)\s*=\s*)(["'])([^"']+?)\2/gi,
-    (match, attr, q, path) => {
-      if (skip.test(path)) return match;
-      if (!assetExt.test(path)) return match;
-      return `${attr}${q}${gameAssetPrefix}${path}${q}`;
-    }
-  );
-
-  return html;
-}
-
-function buildHostMap() {
-  const hostMap = {};
-  for (const d of GAME_DOMAIN_EXACT) {
-    hostMap[d] = `assets/${sanitizeName(d)}`;
-  }
-  if (!activeSession) return hostMap;
+function rewriteRemainingAbsoluteUrls(html, gameFrameBaseUrl) {
+  if (!activeSession) return html;
+  const hosts = new Set();
   for (const file of activeSession.files) {
     if (file.status !== "ok" || !file.sourceUrl) continue;
+    try { hosts.add(new URL(file.sourceUrl).host); } catch {}
+  }
+  for (const d of GAME_DOMAIN_EXACT) hosts.add(d);
+
+  let gameBasePathname = "";
+  let gameHost = "";
+  if (gameFrameBaseUrl) {
     try {
-      const url = new URL(file.sourceUrl);
-      if (url.host && !hostMap[url.host]) {
-        hostMap[url.host] = `assets/${sanitizeName(url.host)}`;
-      }
+      const u = new URL(gameFrameBaseUrl);
+      gameHost = u.host;
+      gameBasePathname = u.pathname;
     } catch {}
   }
-  return hostMap;
-}
 
-function buildRelativeMap(frameBaseUrl) {
-  const map = {};
-  if (!activeSession || !frameBaseUrl) return map;
-  for (const file of activeSession.files) {
-    if (file.status !== "ok" || !file.sourceUrl || !file.localPath) continue;
-    const noQuery = file.sourceUrl.split("?")[0];
-    if (noQuery.startsWith(frameBaseUrl)) {
-      const rel = noQuery.slice(frameBaseUrl.length);
-      if (rel && !rel.startsWith("http")) {
-        map[rel] = `./${file.localPath}`;
+  for (const host of hosts) {
+    for (const proto of ["https://", "http://"]) {
+      const origin = proto + host;
+      const originSlash = origin + "/";
+      if (!html.includes(originSlash) && !html.includes(origin.replace(/\//g, "\\/"))) continue;
+
+      const basePath = (host === gameHost) ? gameBasePathname : "/";
+
+      if (html.includes(originSlash)) {
+        html = html.split(origin + basePath).join("./");
+        if (basePath !== "/") {
+          html = html.split(originSlash).join("./");
+        }
+      }
+      const esc = origin.replace(/\//g, "\\/");
+      const escBase = (origin + basePath).replace(/\//g, "\\/");
+      if (html.includes(esc)) {
+        html = html.split(escBase).join(".\\/");
+        if (basePath !== "/") {
+          html = html.split(esc + "\\/").join(".\\/");
+        }
       }
     }
   }
-  return map;
+  return html;
 }
 
 function buildSpecialUrlMap(gameFrameUrl) {
@@ -716,7 +636,25 @@ function buildSpecialUrlMap(gameFrameUrl) {
   return map;
 }
 
-function buildInterceptorScript(hostMap, relativeMap, specialMap, gameAssetPrefix, relPrefixes) {
+function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
+  const knownHosts = new Set(GAME_DOMAIN_EXACT);
+  if (activeSession) {
+    for (const f of activeSession.files) {
+      if (f.status === "ok" && f.sourceUrl) {
+        try { knownHosts.add(new URL(f.sourceUrl).host); } catch {}
+      }
+    }
+  }
+
+  let gameHost = "", gameBasePath = "/";
+  if (gameFrameBaseUrl) {
+    try {
+      const u = new URL(gameFrameBaseUrl);
+      gameHost = u.host;
+      gameBasePath = u.pathname;
+    } catch {}
+  }
+
   const sdkStub =
     `var _pn=function(){};var _pp=function(){return Promise.resolve()};` +
     `window.PokiSDK={init:_pp,gameplayStart:_pn,gameplayStop:_pn,` +
@@ -731,11 +669,10 @@ function buildInterceptorScript(hostMap, relativeMap, specialMap, gameAssetPrefi
 
   return `<script>(function(){` +
     sdkStub +
-    `var H=${JSON.stringify(hostMap)};` +
-    `var R=${JSON.stringify(relativeMap)};` +
-    `var S=${JSON.stringify(specialMap)};` +
-    `var GP=${JSON.stringify(gameAssetPrefix || "")};` +
-    `var GRP=${JSON.stringify(relPrefixes || [])};` +
+    `var KH=${JSON.stringify(Array.from(knownHosts))};` +
+    `var GH=${JSON.stringify(gameHost)};` +
+    `var GBP=${JSON.stringify(gameBasePath)};` +
+    `var S=${JSON.stringify(specialMap || {})};` +
     `var PD=location.pathname.substring(0,location.pathname.lastIndexOf("/")+1);` +
     `function rw(u){` +
       `if(!u||u.startsWith("data:")||u.startsWith("blob:"))return u;` +
@@ -745,13 +682,11 @@ function buildInterceptorScript(hostMap, relativeMap, specialMap, gameAssetPrefi
         `if(o.protocol!=="http:"&&o.protocol!=="https:")return u;` +
         `if(o.host!==location.host){` +
           `var sk=o.host+o.pathname;if(S[sk])return S[sk];` +
-          `var p=H[o.host];if(p)return"./"+p+o.pathname;}` +
-        `else{var rel=o.pathname;if(rel.startsWith(PD))rel=rel.substring(PD.length);` +
-          `var lc=R[rel];if(lc)return lc;` +
-          `if(GP){for(var gi=0;gi<GRP.length;gi++){` +
-            `if(rel.startsWith(GRP[gi]))return GP+rel;}` +
-          `if(/\\.(?:js|css|json|wasm|data|png|jpe?g|gif|svg|webp|ico|mp3|ogg|wav|m4a|ttf|otf|woff2?|eot|bin|bundle|atlas|fnt|xml|pck|glb|gltf|mem|unityweb)(?:[?#]|$)/i.test(rel))` +
-            `return GP+rel;}}` +
+          `if(KH.indexOf(o.host)>=0){` +
+            `var p=o.pathname;` +
+            `if(o.host===GH&&p.startsWith(GBP))p=p.substring(GBP.length);` +
+            `else if(p.startsWith("/"))p=p.substring(1);` +
+            `return"./"+p;}}` +
       `}catch(e){}return u;}` +
     `var F=window.fetch;` +
     `window.fetch=function(i,o){` +
@@ -793,9 +728,7 @@ function buildInterceptorScript(hostMap, relativeMap, specialMap, gameAssetPrefi
       `if(dT&&dT.set){var origTC=dT.set;Object.defineProperty(Node.prototype,"textContent",{` +
         `set:function(v){if(this.tagName==="STYLE"&&typeof v==="string")v=rwCss(v);` +
           `origTC.call(this,v);},get:dT.get,configurable:true});}}catch(e){}` +
-    `console.log("[poki-dl] interceptor active, hosts:",Object.keys(H).length,` +
-      `"relatives:",Object.keys(R).length,"specials:",Object.keys(S).length,` +
-      `"gamePrefix:",GP);` +
+    `console.log("[poki-dl] interceptor active, knownHosts:",KH.length,"gameHost:",GH);` +
   `})();</script>`;
 }
 
@@ -862,8 +795,8 @@ function stripFirstDivById(html, id) {
   return html;
 }
 
-function injectInterceptor(html, hostMap, relativeMap, specialMap, gameAssetPrefix, relPrefixes) {
-  const script = buildInterceptorScript(hostMap, relativeMap || {}, specialMap || {}, gameAssetPrefix, relPrefixes);
+function injectInterceptor(html, gameFrameBaseUrl, specialMap) {
+  const script = buildInterceptorScript(gameFrameBaseUrl, specialMap);
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch) {
     return html.replace(headMatch[0], headMatch[0] + script);
@@ -887,17 +820,25 @@ async function getPageInfoFromTab(tabId) {
 
 function urlToLocalPath(urlString) {
   const url = new URL(urlString);
-  const host = sanitizeName(url.host);
-  const segments = url.pathname
-    .split("/")
-    .filter(Boolean)
-    .map((s) => sanitizeName(s));
+  let pathname = url.pathname;
+
+  if (activeSession?.htmlCaptured?.gameUrl) {
+    try {
+      const gameBase = getBaseUrl(activeSession.htmlCaptured.gameUrl);
+      const gameU = new URL(gameBase);
+      if (url.host === gameU.host && pathname.startsWith(gameU.pathname)) {
+        pathname = pathname.slice(gameU.pathname.length);
+      }
+    } catch {}
+  }
+
+  const segments = pathname.split("/").filter(Boolean).map((s) => sanitizeName(s));
   let filePath = segments.join("/") || "index";
   if (url.search) {
     const h = simpleHash(url.search).slice(0, 8);
     filePath = appendSuffix(filePath, `__q${h}`);
   }
-  return `assets/${host}/${filePath}`;
+  return filePath;
 }
 
 function appendSuffix(path, suffix) {
