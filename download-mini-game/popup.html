@@ -55,10 +55,63 @@
         white-space: pre-wrap;
       }
 
+      .status.error {
+        color: #dc2626;
+      }
+
       .hint {
         margin-top: 10px;
         font-size: 11px;
         color: #6b7280;
+      }
+
+      .asset-section {
+        margin-top: 12px;
+        border-top: 1px solid #e5e7eb;
+        padding-top: 10px;
+      }
+
+      .asset-section h2 {
+        font-size: 13px;
+        margin: 0 0 8px;
+        color: #374151;
+      }
+
+      .asset-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+
+      .asset-row label {
+        font-size: 11px;
+        color: #6b7280;
+        white-space: nowrap;
+        min-width: 72px;
+      }
+
+      .asset-row input {
+        flex: 1;
+        min-width: 0;
+        border: 1px solid #d1d5db;
+        border-radius: 5px;
+        padding: 5px 7px;
+        font-size: 11px;
+        color: #111827;
+        outline: none;
+      }
+
+      .asset-row input:focus {
+        border-color: #10b981;
+      }
+
+      .asset-row button {
+        width: auto;
+        padding: 5px 10px;
+        font-size: 11px;
+        border-radius: 5px;
+        flex-shrink: 0;
       }
     </style>
   </head>
@@ -69,6 +122,26 @@
     <button id="captureBtn" class="secondary" disabled>生成 HTML（游戏加载后点）</button>
     <button id="stopBtn" class="secondary" disabled>停止监听并写入清单</button>
     <div id="status" class="status"></div>
+
+    <div class="asset-section">
+      <h2>附加资源下载</h2>
+      <div class="asset-row">
+        <label>游戏图标</label>
+        <input type="text" id="gameIconUrl" placeholder="game_icon URL" />
+        <button class="secondary" id="dlGameIcon">下载</button>
+      </div>
+      <div class="asset-row">
+        <label>预览视频</label>
+        <input type="text" id="thumbnailVideoUrl" placeholder="thumbnail_video URL" />
+        <button class="secondary" id="dlThumbnailVideo">下载</button>
+      </div>
+      <div class="asset-row">
+        <label>游戏封面</label>
+        <input type="text" id="gameCoverUrl" placeholder="game_cover URL" />
+        <button class="secondary" id="dlGameCover">下载</button>
+      </div>
+    </div>
+
     <div class="hint">文件名路径前缀：download-mini-games/&lt;game-name&gt;/</div>
     <script src="popup.js"></script>
   </body>

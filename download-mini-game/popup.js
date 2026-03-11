@@ -5,6 +5,12 @@ const statusEl = document.getElementById("status");
 
 function setStatus(text) {
   statusEl.textContent = text;
+  statusEl.classList.remove("error");
+}
+
+function setError(text) {
+  statusEl.textContent = text;
+  statusEl.classList.add("error");
 }
 
 async function getActiveTab() {
@@ -155,6 +161,44 @@ stopBtn.addEventListener("click", async () => {
     updateButtons("idle");
   }
 });
+
+/* ── Asset download buttons ── */
+
+const assetButtons = [
+  { btn: "dlGameIcon", input: "gameIconUrl", key: "game_icon" },
+  { btn: "dlThumbnailVideo", input: "thumbnailVideoUrl", key: "thumbnail_video" },
+  { btn: "dlGameCover", input: "gameCoverUrl", key: "game_cover" }
+];
+
+for (const { btn, input, key } of assetButtons) {
+  document.getElementById(btn).addEventListener("click", async () => {
+    const url = document.getElementById(input).value.trim();
+    if (!url) return;
+    const button = document.getElementById(btn);
+    button.disabled = true;
+    button.textContent = "...";
+    try {
+      const tab = await getActiveTab();
+      if (!tab?.id) throw new Error("未找到标签页");
+      const result = await chrome.runtime.sendMessage({
+        type: "DOWNLOAD_ASSET",
+        tabId: tab.id,
+        url,
+        assetKey: key
+      });
+      if (!result) throw new Error("后台无响应，请关闭弹窗后重试，或到 chrome://extensions 重新加载插件");
+      if (!result.ok) throw new Error(result.error || "下载失败");
+      button.textContent = "✓";
+      setTimeout(() => { button.textContent = "下载"; button.disabled = false; }, 1500);
+    } catch (e) {
+      button.textContent = "✗";
+      setError(`资源下载失败: ${e.message}`);
+      setTimeout(() => { button.textContent = "下载"; button.disabled = false; }, 2000);
+    }
+  });
+}
+
+/* ── Polling ── */
 
 let pollTimer = null;
 function startPolling() {

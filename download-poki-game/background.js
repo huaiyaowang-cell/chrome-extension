@@ -398,12 +398,11 @@ async function captureAndSaveHtml(tabId) {
 
   await generateIndexHtml(rawHtml, gameUrl);
   await generateSdkStubFile();
-  await generateInterceptorFile();
 
   activeSession.htmlCaptured = true;
   await persistSession();
 
-  return { message: "已生成 index.html、poki-sdk-stub.js、interceptor.js" };
+  return { message: "已生成 index.html、poki-sdk-stub.js" };
 }
 
 async function stopMonitor(tabId) {
@@ -464,8 +463,7 @@ async function generateIndexHtml(rawHtml, gameUrl) {
   html = neutralizePokiSdk(html);
   html = removeDynamicLoaderContent(html, detectGameEngine());
 
-  const scriptTags =
-    '<script src="poki-sdk-stub.js"></script>\n<script src="interceptor.js"></script>';
+  const scriptTags = '<script src="poki-sdk-stub.js"></script>';
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch) {
     html = html.replace(headMatch[0], headMatch[0] + "\n" + scriptTags);

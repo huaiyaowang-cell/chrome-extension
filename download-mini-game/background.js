@@ -50,6 +50,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
+  if (message?.type === "DOWNLOAD_ASSET") {
+    const respond = (r) => { try { sendResponse(r); } catch (_) {} };
+    sessionReady
+      .then(() => downloadExtraAsset(message.tabId, message.url, message.assetKey))
+      .then((r) => respond({ ok: true, ...r }))
+      .catch((e) => respond({ ok: false, error: e && e.message ? e.message : String(e) }))
+      .finally(() => {});
+    return true;
+  }
   return false;
 });
 
@@ -272,6 +281,28 @@ async function onPlayIframeDetected(tabId, src) {
   }
   await flushRequestBuffer();
   await persistSession();
+
+  if (!findInNetworkCache(src)) {
+    await fetchAndCacheGameHtml(src);
+  }
+}
+
+async function fetchAndCacheGameHtml(gameUrl) {
+  try {
+    const resp = await fetch(gameUrl, { cache: "no-store" });
+    if (!resp.ok) {
+      console.warn(`[minigame-dl] fetch game HTML failed: ${resp.status} ${gameUrl}`);
+      return;
+    }
+    const html = await resp.text();
+    if (!html || html.length < 50) return;
+    networkHtmlCache.set(gameUrl, html);
+    const base = gameUrl.split("?")[0];
+    if (base !== gameUrl) networkHtmlCache.set(base, html);
+    console.log(`[minigame-dl] game HTML fetched via fetch: ${html.length} bytes`);
+  } catch (e) {
+    console.warn("[minigame-dl] fetchAndCacheGameHtml failed:", e.message);
+  }
 }
 
 async function flushRequestBuffer() {
@@ -366,6 +397,7 @@ async function startMonitor(tabId) {
   startPlayIframeDetection(tabId);
 
   await persistSession();
+  await chrome.storage.local.set({ lastGameInfo: { gameName, folder } });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#10b981" });
   await chrome.action.setBadgeText({ tabId, text: "ON" });
 
@@ -385,7 +417,7 @@ async function captureAndSaveHtml(tabId) {
   const rawHtml = findInNetworkCache(gameUrl);
   if (!rawHtml) {
     throw new Error(
-      `未检测到 ${gameUrl.slice(0, 80)} 的网络缓存 (共 ${networkHtmlCache.size} 条)`
+      `未检测到 ${gameUrl.slice(0, 80)} 的网络缓存 (共 ${networkHtmlCache.size} 条)，请先开始监听再刷新页面进入游戏`
     );
   }
 
@@ -504,8 +536,7 @@ async function generateIndexHtml(rawHtml, gameUrl) {
   html = neutralizeMinigameSdk(html);
   html = removeDynamicLoaderContent(html, detectGameEngine());
 
-  const scriptTags =
-    '<script src="minigame-sdk-stub.js"></script>\n<script src="interceptor.js"></script>';
+  const scriptTags = '<script src="minigame-sdk-stub.js"></script>';
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch) {
     html = html.replace(headMatch[0], headMatch[0] + "\n" + scriptTags);
@@ -1052,6 +1083,62 @@ function safeHost(urlString) {
 function isTrackerUrl(url) {
   const lower = url.toLowerCase();
   return TRACKER_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+/* ── Extra asset download ──────────────────────────────────── */
+
+async function downloadExtraAsset(tabId, url, assetKey) {
+  if (!url || !url.startsWith("http")) {
+    throw new Error("请输入有效的 URL 地址。");
+  }
+
+  let gameName, folder;
+  if (activeSession) {
+    gameName = activeSession.gameName;
+    folder = activeSession.folder;
+  } else {
+    const stored = await chrome.storage.local.get("lastGameInfo");
+    const info = stored.lastGameInfo;
+    if (!info?.gameName || !info?.folder) {
+      throw new Error("无游戏信息，请先开始监听并下载一次游戏。");
+    }
+    gameName = info.gameName;
+    folder = info.folder;
+  }
+
+  const ext = extractExtFromUrl(url);
+  const filename = `${gameName}_${assetKey}${ext}`;
+  const localPath = `__assets__/${filename}`;
+  const fullPath = `${folder}/${localPath}`;
+
+  await downloadUrl(url, fullPath);
+
+  if (activeSession) {
+    upsertFile({
+      type: "extra-asset",
+      sourceUrl: url,
+      localPath,
+      status: "ok",
+      assetKey
+    });
+    activeSession.stats.downloaded += 1;
+    schedulePersist();
+    scheduleManifest();
+    await updateBadgeCount();
+  }
+
+  console.log(`[minigame-dl] extra asset downloaded: ${localPath}`);
+  return { localPath, filename };
+}
+
+function extractExtFromUrl(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    const lastSegment = pathname.split("/").pop() || "";
+    const dotIdx = lastSegment.lastIndexOf(".");
+    if (dotIdx > 0) return lastSegment.slice(dotIdx).toLowerCase();
+  } catch {}
+  return "";
 }
 
 /* ── Download helpers ──────────────────────────────────────── */
