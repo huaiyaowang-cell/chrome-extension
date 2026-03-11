@@ -379,6 +379,10 @@ async function handleRequest(details) {
     return;
   }
 
+  if (!activeSession.htmlCaptured.gameUrl) {
+    tryInferGameUrl(url);
+  }
+
   if (isTrackerUrl(url)) {
     activeSession.stats.skipped += 1;
     return;
@@ -1098,6 +1102,20 @@ async function getPageInfoFromTab(tabId) {
   return results?.[0]?.result || null;
 }
 
+function tryInferGameUrl(url) {
+  const host = safeHost(url);
+  if (!GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) return;
+  try {
+    const u = new URL(url);
+    const segments = u.pathname.split("/").filter(Boolean);
+    if (segments.length >= 2) {
+      const inferred = `${u.origin}/${segments[0]}/index.html`;
+      activeSession.htmlCaptured.gameUrl = inferred;
+      console.log(`[mini-dl] gameUrl inferred from asset: ${inferred}`);
+    }
+  } catch {}
+}
+
 function urlToLocalPath(urlString) {
   const url = new URL(urlString);
   let pathname = url.pathname;
@@ -1110,6 +1128,16 @@ function urlToLocalPath(urlString) {
         pathname = pathname.slice(gameU.pathname.length);
       }
     } catch {}
+  }
+
+  if (pathname === url.pathname) {
+    const host = safeHost(urlString);
+    if (GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) {
+      const segs = pathname.split("/").filter(Boolean);
+      if (segs.length >= 2) {
+        pathname = "/" + segs.slice(1).join("/");
+      }
+    }
   }
 
   const segments = pathname.split("/").filter(Boolean).map((s) => sanitizeName(s));
