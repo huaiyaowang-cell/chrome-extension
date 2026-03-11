@@ -5,6 +5,12 @@ const statusEl = document.getElementById("status");
 
 function setStatus(text) {
   statusEl.textContent = text;
+  statusEl.classList.remove("error");
+}
+
+function setError(text) {
+  statusEl.textContent = text;
+  statusEl.classList.add("error");
 }
 
 async function getActiveTab() {
@@ -74,7 +80,7 @@ async function refreshStatus() {
       renderStatus(result);
     }
   } catch {
-    setStatus("无法获取状态，请重新加载插件。");
+    setError("无法获取状态，请重新加载插件。");
   }
 }
 
@@ -99,7 +105,7 @@ startBtn.addEventListener("click", async () => {
     );
     updateButtons("listening");
   } catch (error) {
-    setStatus(`错误: ${error.message}`);
+    setError(`错误: ${error.message}`);
     updateButtons("idle");
   }
 });
@@ -122,7 +128,7 @@ captureBtn.addEventListener("click", async () => {
 
     setStatus(`生成成功！\n${result.message}`);
   } catch (error) {
-    setStatus(`生成失败: ${error.message}`);
+    setError(`生成失败: ${error.message}`);
   } finally {
     captureBtn.textContent = "生成 HTML（游戏加载后点）";
     captureBtn.disabled = false;
@@ -152,10 +158,48 @@ stopBtn.addEventListener("click", async () => {
       renderStatus(result);
     }
   } catch (error) {
-    setStatus(`错误: ${error.message}`);
+    setError(`错误: ${error.message}`);
     updateButtons("idle");
   }
 });
+
+/* ── Asset download buttons ── */
+
+const assetButtons = [
+  { btn: "dlGameIcon", input: "gameIconUrl", key: "game_icon" },
+  { btn: "dlThumbnailVideo", input: "thumbnailVideoUrl", key: "thumbnail_video" },
+  { btn: "dlGameCover", input: "gameCoverUrl", key: "game_cover" }
+];
+
+for (const { btn, input, key } of assetButtons) {
+  document.getElementById(btn).addEventListener("click", async () => {
+    const url = document.getElementById(input).value.trim();
+    if (!url) return;
+    const button = document.getElementById(btn);
+    button.disabled = true;
+    button.textContent = "...";
+    try {
+      const tab = await getActiveTab();
+      if (!tab?.id) throw new Error("未找到标签页");
+      const result = await chrome.runtime.sendMessage({
+        type: "DOWNLOAD_ASSET",
+        tabId: tab.id,
+        url,
+        assetKey: key
+      });
+      if (!result) throw new Error("后台无响应");
+      if (!result.ok) throw new Error(result.error || "下载失败");
+      button.textContent = "✓";
+      setTimeout(() => { button.textContent = "下载"; button.disabled = false; }, 1500);
+    } catch (e) {
+      button.textContent = "✗";
+      setError(`资源下载失败: ${e.message}`);
+      setTimeout(() => { button.textContent = "下载"; button.disabled = false; }, 2000);
+    }
+  });
+}
+
+/* ── Polling ── */
 
 let pollTimer = null;
 function startPolling() {

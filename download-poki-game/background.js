@@ -49,6 +49,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
+  if (message?.type === "DOWNLOAD_ASSET") {
+    sessionReady
+      .then(() => downloadExtraAsset(message.tabId, message.url, message.assetKey))
+      .then((r) => sendResponse({ ok: true, ...r }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
   return false;
 });
 
@@ -365,6 +372,7 @@ async function startMonitor(tabId) {
   startGameframeDetection(tabId);
 
   await persistSession();
+  await chrome.storage.local.set({ lastGameInfo: { gameName, folder } });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
   await chrome.action.setBadgeText({ tabId, text: "ON" });
 
@@ -983,6 +991,61 @@ function safeHost(urlString) {
 function isTrackerUrl(url) {
   const lower = url.toLowerCase();
   return TRACKER_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+/* ── Extra asset download ──────────────────────────────────── */
+
+async function downloadExtraAsset(tabId, url, assetKey) {
+  if (!url || !url.startsWith("http")) {
+    throw new Error("请输入有效的 URL 地址。");
+  }
+
+  let gameName, folder;
+  if (activeSession) {
+    gameName = activeSession.gameName;
+    folder = activeSession.folder;
+  } else {
+    const stored = await chrome.storage.local.get("lastGameInfo");
+    const info = stored.lastGameInfo;
+    if (!info?.gameName || !info?.folder) {
+      throw new Error("无游戏信息，请先开始监听并下载一次游戏。");
+    }
+    gameName = info.gameName;
+    folder = info.folder;
+  }
+
+  const ext = extractExtFromUrl(url);
+  const filename = `${gameName}_${assetKey}${ext}`;
+  const localPath = `__assets__/${filename}`;
+  const fullPath = `${folder}/${localPath}`;
+
+  await downloadUrl(url, fullPath);
+
+  if (activeSession) {
+    upsertFile({
+      type: "extra-asset",
+      sourceUrl: url,
+      localPath,
+      status: "ok",
+      assetKey
+    });
+    activeSession.stats.downloaded += 1;
+    schedulePersist();
+    scheduleManifest();
+  }
+
+  console.log(`[poki-dl] extra asset downloaded: ${localPath}`);
+  return { localPath, filename };
+}
+
+function extractExtFromUrl(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    const lastSegment = pathname.split("/").pop() || "";
+    const dotIdx = lastSegment.lastIndexOf(".");
+    if (dotIdx > 0) return lastSegment.slice(dotIdx).toLowerCase();
+  } catch {}
+  return "";
 }
 
 /* ── Download helpers ──────────────────────────────────────── */

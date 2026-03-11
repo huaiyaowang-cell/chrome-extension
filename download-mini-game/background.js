@@ -1,17 +1,5 @@
 const OUTPUT_PREFIX = "download-mini-games";
 
-const GAME_DOMAIN_SUFFIXES = [
-  ".apps.minigame.vip",
-  ".minigame.vip"
-];
-const GAME_DOMAIN_EXACT = [
-  "apps.minigame.vip",
-  "sdk.minigame.vip"
-];
-const PAGE_HOSTS = [
-  "www.minigame.com",
-  "minigame.com"
-];
 const TRACKER_KEYWORDS = [
   "google-analytics", "googletagmanager", "doubleclick",
   "googlesyndication", "adservice.", "sentry.io",
@@ -20,26 +8,19 @@ const TRACKER_KEYWORDS = [
   "statsig", "branch.io", "adjust.com",
   "gtag/js"
 ];
-const GAME_EXTENSIONS = new Set([
-  "js", "mjs", "css", "json", "wasm",
-  "data", "unityweb", "bundle", "mem", "bin", "pck", "arcd", "dmanifest", "projectc",
-  "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "avif",
-  "mp3", "ogg", "wav", "m4a", "aac", "webm", "mp4", "flac",
-  "woff", "woff2", "ttf", "otf", "eot",
-  "xml", "atlas", "fnt", "txt", "csv", "tsv", "tmx", "tsx",
-  "glb", "gltf", "fbx", "obj",
-  "spine", "skel", "ase", "aseprite",
-  "map", "ldtk", "tiled"
-]);
 
 let activeSession = null;
 let persistTimer = null;
 let manifestTimer = null;
 let debuggerAttached = false;
 let pendingNetworkCaptures = new Map();
-let processHtmlTimer = null;
+const networkHtmlCache = new Map();
+let playIframeTimer = null;
+let requestBuffer = [];
 
 const sessionReady = restoreSession();
+
+/* ── Chrome message listener ───────────────────────────────── */
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "START_MONITOR") {
@@ -64,7 +45,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "CAPTURE_HTML") {
     sessionReady
-      .then(() => manualCaptureHtml(message.tabId))
+      .then(() => captureAndSaveHtml(message.tabId))
       .then((r) => sendResponse({ ok: true, ...r }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -72,33 +53,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
+/* ── webRequest listener ───────────────────────────────────── */
+
 chrome.webRequest.onCompleted.addListener(
   (details) => {
     if (details.tabId < 0) return;
     void sessionReady.then(() => {
       if (!activeSession || details.tabId !== activeSession.tabId) return;
       if (activeSession.status !== "listening") return;
-      void handleRequest(details);
+
+      activeSession.stats.totalSeen += 1;
+      const url = details.url;
+      if (!url.startsWith("http")) return;
+      if (details.type === "main_frame" || details.type === "sub_frame") return;
+      if (activeSession.seenUrls.has(url)) return;
+      if (isTrackerUrl(url)) {
+        activeSession.stats.skipped += 1;
+        return;
+      }
+
+      if (!activeSession.gameHost) {
+        requestBuffer.push({ url, type: details.type });
+        return;
+      }
+
+      void processRequest(url, details.type);
     });
   },
   { urls: ["http://*/*", "https://*/*"] }
 );
 
-chrome.webNavigation.onCompleted.addListener((details) => {
-  void sessionReady.then(() => {
-    if (!activeSession || details.tabId !== activeSession.tabId) return;
-    if (activeSession.status !== "listening") return;
-    scheduleProcessHtml();
-  });
-});
+/* ── Tab removal ───────────────────────────────────────────── */
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (activeSession?.tabId === tabId) {
+    stopPlayIframeDetection();
     void detachDebugger(tabId);
     activeSession = null;
     chrome.storage.local.remove("activeSession");
   }
 });
+
+/* ── CDP event listeners ───────────────────────────────────── */
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!activeSession || source.tabId !== activeSession.tabId) return;
@@ -108,13 +104,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     const { response, requestId, type } = params;
     if (type !== "Document") return;
     const url = response.url || "";
-    const host = safeHost(url);
-
-    const isGame = GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s));
-
-    if (isGame) {
-      pendingNetworkCaptures.set(requestId, { isGame, url });
-      console.log(`[minigame-dl] responseReceived: game frame → ${url.slice(0, 120)}`);
+    if (url && url.startsWith("http")) {
+      pendingNetworkCaptures.set(requestId, { url });
     }
   }
 
@@ -135,6 +126,8 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
 });
 
+/* ── CDP functions ─────────────────────────────────────────── */
+
 async function attachDebugger(tabId) {
   if (debuggerAttached) return true;
   return new Promise((resolve) => {
@@ -152,7 +145,6 @@ async function attachDebugger(tabId) {
         }
         debuggerAttached = true;
         pendingNetworkCaptures.clear();
-        console.log("[minigame-dl] debugger attached, Network.enable sent");
         resolve(true);
       });
     });
@@ -191,17 +183,15 @@ async function captureResponseBody(tabId, requestId, info) {
     const body = result.base64Encoded ? decodeBase64Body(result.body) : result.body;
     if (!body || body.length < 50) return;
 
-    if (!activeSession.htmlCache) {
-      activeSession.htmlCache = { gameRawHtml: null };
+    if (networkHtmlCache.size > 100) {
+      const oldest = networkHtmlCache.keys().next().value;
+      networkHtmlCache.delete(oldest);
     }
 
-    if (info.isGame) {
-      activeSession.htmlCache.gameRawHtml = body;
-      activeSession.htmlCaptured.gameUrl = info.url;
-      console.log("[minigame-dl] game HTML cached from network, length:", body.length);
-    }
-
-    scheduleProcessHtml();
+    networkHtmlCache.set(info.url, body);
+    const baseUrl = info.url.split("?")[0];
+    if (baseUrl !== info.url) networkHtmlCache.set(baseUrl, body);
+    console.log(`[minigame-dl] HTML cached: ${info.url.slice(0, 100)} (${body.length} bytes, total=${networkHtmlCache.size})`);
   } catch (e) {
     console.warn("[minigame-dl] getResponseBody failed:", e.message);
   }
@@ -216,19 +206,128 @@ function decodeBase64Body(base64) {
   return new TextDecoder().decode(bytes);
 }
 
-function scheduleProcessHtml() {
-  clearTimeout(processHtmlTimer);
-  processHtmlTimer = setTimeout(() => {
-    processHtmlTimer = null;
-    void processAndSaveCachedHtml();
-  }, 5000);
+function findInNetworkCache(url) {
+  if (!url) return null;
+  if (networkHtmlCache.has(url)) return networkHtmlCache.get(url);
+  const base = url.split("?")[0];
+  if (base !== url && networkHtmlCache.has(base)) return networkHtmlCache.get(base);
+  try {
+    const target = new URL(url);
+    for (const [cachedUrl, body] of networkHtmlCache) {
+      try {
+        const cached = new URL(cachedUrl);
+        if (cached.host === target.host && cached.pathname === target.pathname) return body;
+      } catch {}
+    }
+  } catch {}
+  return null;
 }
+
+/* ── playIframe detection ──────────────────────────────────── */
+
+function startPlayIframeDetection(tabId) {
+  stopPlayIframeDetection();
+  playIframeTimer = setInterval(() => void detectPlayIframe(tabId), 1500);
+  void detectPlayIframe(tabId);
+}
+
+function stopPlayIframeDetection() {
+  if (playIframeTimer) {
+    clearInterval(playIframeTimer);
+    playIframeTimer = null;
+  }
+}
+
+async function detectPlayIframe(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const iframe = document.getElementById("playIframe");
+        return iframe?.src || null;
+      }
+    });
+    const src = results?.find((r) => r.result)?.result || null;
+    if (src) {
+      console.log(`[minigame-dl] playIframe detected: ${src.slice(0, 120)}`);
+      stopPlayIframeDetection();
+      await onPlayIframeDetected(tabId, src);
+    }
+  } catch {
+    /* frame might not be ready yet */
+  }
+}
+
+async function onPlayIframeDetected(tabId, src) {
+  if (!activeSession || activeSession.tabId !== tabId) return;
+  try {
+    const url = new URL(src);
+    activeSession.gameHost = url.host;
+    activeSession.gameUrl = src;
+    activeSession.gameBaseUrl = getBaseUrl(src);
+    console.log(`[minigame-dl] game host: ${url.host}, base: ${activeSession.gameBaseUrl}`);
+  } catch (e) {
+    console.warn("[minigame-dl] failed to parse playIframe src:", e.message);
+    return;
+  }
+  await flushRequestBuffer();
+  await persistSession();
+}
+
+async function flushRequestBuffer() {
+  const buffer = requestBuffer;
+  requestBuffer = [];
+  console.log(`[minigame-dl] flushing ${buffer.length} buffered requests`);
+  for (const req of buffer) {
+    await processRequest(req.url, req.type);
+  }
+}
+
+/* ── Request processing ────────────────────────────────────── */
+
+async function processRequest(url, requestType) {
+  if (!activeSession?.gameHost) return;
+  const host = safeHost(url);
+  if (host !== activeSession.gameHost) return;
+  if (activeSession.seenUrls.has(url)) return;
+  activeSession.seenUrls.add(url);
+  if (activeSession.pending.has(url)) return;
+  activeSession.pending.add(url);
+
+  const localPath = urlToLocalPath(url);
+  try {
+    await downloadUrl(url, `${activeSession.folder}/${localPath}`);
+    activeSession.stats.downloaded += 1;
+    activeSession.files.push({
+      type: "asset",
+      sourceUrl: url,
+      localPath,
+      status: "ok",
+      requestType
+    });
+    await updateBadgeCount();
+  } catch (error) {
+    activeSession.stats.failed += 1;
+    activeSession.files.push({
+      type: "asset",
+      sourceUrl: url,
+      localPath,
+      status: "failed",
+      requestType,
+      error: String(error?.message || error)
+    });
+  } finally {
+    activeSession.pending.delete(url);
+    schedulePersist();
+    scheduleManifest();
+  }
+}
+
+/* ── Monitor lifecycle ─────────────────────────────────────── */
 
 async function startMonitor(tabId) {
   const pageInfo = await getPageInfoFromTab(tabId);
-  if (!pageInfo?.pageUrl) {
-    throw new Error("无法读取页面信息。");
-  }
+  if (!pageInfo?.pageUrl) throw new Error("无法读取页面信息。");
 
   let host;
   try {
@@ -236,7 +335,7 @@ async function startMonitor(tabId) {
   } catch {
     throw new Error("页面 URL 无法解析。");
   }
-  if (!PAGE_HOSTS.some((h) => host === h || host.endsWith("." + h))) {
+  if (host !== "minigame.com" && !host.endsWith(".minigame.com")) {
     throw new Error("请在 minigame.com 游戏页面开启监听。");
   }
 
@@ -250,18 +349,21 @@ async function startMonitor(tabId) {
     pageUrl: pageInfo.pageUrl,
     startedAt: new Date().toISOString(),
     status: "listening",
+    gameHost: null,
+    gameUrl: null,
+    gameBaseUrl: null,
     seenUrls: new Set(),
     pending: new Set(),
     stats: { totalSeen: 0, downloaded: 0, failed: 0, skipped: 0 },
     files: [],
-    htmlCaptured: { game: false },
-    htmlCache: { gameRawHtml: null }
+    htmlCaptured: false
   };
 
+  requestBuffer = [];
+  networkHtmlCache.clear();
+
   const dbgOk = await attachDebugger(tabId);
-  if (!dbgOk) {
-    console.warn("[minigame-dl] debugger not available — HTML will fallback to DOM capture");
-  }
+  startPlayIframeDetection(tabId);
 
   await persistSession();
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#10b981" });
@@ -270,57 +372,93 @@ async function startMonitor(tabId) {
   return { gameName, folder, status: "listening", debugger: dbgOk };
 }
 
-async function manualCaptureHtml(tabId) {
+async function captureAndSaveHtml(tabId) {
   if (!activeSession || activeSession.tabId !== tabId) {
     throw new Error("当前没有监听会话。");
   }
 
-  activeSession.htmlCaptured.game = false;
-
-  const hasGameCache = !!activeSession.htmlCache?.gameRawHtml;
-
-  if (hasGameCache) {
-    await processAndSaveCachedHtml(true);
+  const gameUrl = activeSession.gameUrl;
+  if (!gameUrl) {
+    throw new Error("尚未检测到 playIframe，请等待游戏加载完成。");
   }
 
-  if (!activeSession.htmlCaptured.game) {
-    await captureFrameHtml();
+  const rawHtml = findInNetworkCache(gameUrl);
+  if (!rawHtml) {
+    throw new Error(
+      `未检测到 ${gameUrl.slice(0, 80)} 的网络缓存 (共 ${networkHtmlCache.size} 条)`
+    );
   }
 
-  const captured = [];
-  const sources = [];
-  if (activeSession.htmlCaptured.game) {
-    captured.push("game.html");
-    sources.push(hasGameCache ? "network" : "DOM");
-  }
+  await generateIndexHtml(rawHtml, gameUrl);
+  await generateSdkStubFile();
+  await generateInterceptorFile();
 
-  if (captured.length === 0) {
-    throw new Error("未能抓取到任何 HTML，请确认游戏已完全加载，或刷新页面后重试。");
-  }
-
+  activeSession.htmlCaptured = true;
   await persistSession();
-  return {
-    captured,
-    message: `已抓取: ${captured.join(", ")} (来源: ${sources.join(", ")})`
-  };
+
+  return { message: "已生成 index.html、minigame-sdk-stub.js、interceptor.js" };
+}
+
+async function captureIframeDom(tabId) {
+  try {
+    const allFrames = await chrome.webNavigation.getAllFrames({ tabId });
+    if (!allFrames) return null;
+
+    const gameHost = activeSession.gameHost;
+    let gameFrameId = -1;
+
+    for (const frame of allFrames) {
+      const host = safeHost(frame.url || "");
+      if (host === gameHost) {
+        gameFrameId = frame.frameId;
+        break;
+      }
+    }
+
+    if (gameFrameId < 0) {
+      for (const frame of allFrames) {
+        if (frame.parentFrameId === 0 && frame.frameId !== 0 && (frame.url || "").startsWith("http")) {
+          gameFrameId = frame.frameId;
+          break;
+        }
+      }
+    }
+
+    if (gameFrameId < 0) {
+      console.warn("[minigame-dl] DOM capture: no matching iframe found");
+      return null;
+    }
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [gameFrameId] },
+      func: () => document.documentElement?.outerHTML || ""
+    });
+
+    const html = results?.[0]?.result || "";
+    if (html && html.length > 50) {
+      console.log(`[minigame-dl] DOM capture succeeded: ${html.length} bytes`);
+      return html;
+    }
+  } catch (e) {
+    console.warn("[minigame-dl] DOM capture failed:", e.message);
+  }
+  return null;
 }
 
 async function stopMonitor(tabId) {
   if (!activeSession || activeSession.tabId !== tabId) {
-    return { status: "idle", debug: "no active session for this tab" };
+    return { status: "idle" };
   }
 
+  stopPlayIframeDetection();
   const errors = [];
 
-  try {
-    await processAndSaveCachedHtml(true);
-  } catch (e) {
-    errors.push(`processHtml: ${e.message}`);
-  }
-  try {
-    await captureFrameHtml();
-  } catch (e) {
-    errors.push(`captureFrameHtml: ${e.message}`);
+  if (!activeSession.htmlCaptured && activeSession.gameUrl) {
+    try {
+      await captureAndSaveHtml(tabId);
+    } catch (e) {
+      errors.push(e.message);
+    }
   }
 
   try {
@@ -337,9 +475,7 @@ async function stopMonitor(tabId) {
   }
 
   const result = buildStatusPayload();
-  if (errors.length > 0) {
-    result.warnings = errors;
-  }
+  if (errors.length > 0) result.warnings = errors;
 
   try {
     await chrome.action.setBadgeText({ tabId, text: "" });
@@ -347,303 +483,358 @@ async function stopMonitor(tabId) {
 
   activeSession = null;
   await chrome.storage.local.remove("activeSession");
-
   return result;
 }
 
 function getMonitorStatus(tabId) {
-  if (!activeSession || activeSession.tabId !== tabId) {
-    return { status: "idle" };
-  }
+  if (!activeSession || activeSession.tabId !== tabId) return { status: "idle" };
   return buildStatusPayload();
 }
 
-async function handleRequest(details) {
-  activeSession.stats.totalSeen += 1;
+/* ── HTML & script generation ──────────────────────────────── */
 
-  const url = details.url;
-  if (!url.startsWith("http")) return;
-  if (activeSession.seenUrls.has(url)) return;
-
-  if (details.type === "sub_frame") {
-    const host = safeHost(url);
-
-    if (!activeSession.htmlCaptured.gameUrl && GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) {
-      activeSession.htmlCaptured.gameUrl = url;
-    }
-
-    return;
-  }
-
-  if (details.type === "main_frame") {
-    return;
-  }
-
-  if (!activeSession.htmlCaptured.gameUrl) {
-    tryInferGameUrl(url);
-  }
-
-  if (isTrackerUrl(url)) {
-    activeSession.stats.skipped += 1;
-    return;
-  }
-
-  if (!isGameRelated(url, details)) {
-    activeSession.stats.skipped += 1;
-    return;
-  }
-
-  activeSession.seenUrls.add(url);
-
-  if (activeSession.pending.has(url)) return;
-  activeSession.pending.add(url);
-
-  const localPath = urlToLocalPath(url);
-  try {
-    await downloadUrl(url, `${activeSession.folder}/${localPath}`);
-    activeSession.stats.downloaded += 1;
-    activeSession.files.push({
-      type: "asset",
-      sourceUrl: url,
-      localPath,
-      status: "ok",
-      requestType: details.type
-    });
-    await updateBadgeCount();
-  } catch (error) {
-    activeSession.stats.failed += 1;
-    activeSession.files.push({
-      type: "asset",
-      sourceUrl: url,
-      localPath,
-      status: "failed",
-      requestType: details.type,
-      error: String(error?.message || error)
-    });
-  } finally {
-    activeSession.pending.delete(url);
-    schedulePersist();
-    scheduleManifest();
-  }
-}
-
-function isGameRelated(url, details) {
-  if (isGameDomain(url)) return true;
-
-  const pathname = safePathname(url).toLowerCase();
-
-  if (pathname.includes("/build/") || pathname.includes("/release/") || pathname.includes("/templatedata/")) {
-    return true;
-  }
-
-  const lowerUrl = url.toLowerCase();
-  if (lowerUrl.includes("minigame") || lowerUrl.includes("cocos2d") || lowerUrl.includes("cocos-js") ||
-      lowerUrl.includes("unity-2020") || lowerUrl.includes("unity-loader") || lowerUrl.includes("/loaders/")) {
-    return true;
-  }
-
-  if (["script", "stylesheet"].includes(details.type)) {
-    if (isGameDomainInitiator(details)) return true;
-  }
-
-  const ext = getCoreExtension(pathname);
-  if (GAME_EXTENSIONS.has(ext)) {
-    if (isGameDomainInitiator(details)) return true;
-    if (details.type === "xmlhttprequest" || details.type === "fetch" || details.type === "other") return true;
-  }
-
-  return false;
-}
-
-function isGameDomain(url) {
-  try {
-    const host = new URL(url).host;
-    if (GAME_DOMAIN_EXACT.includes(host)) return true;
-    return GAME_DOMAIN_SUFFIXES.some((suffix) => host.endsWith(suffix));
-  } catch {
-    return false;
-  }
-}
-
-function isGameDomainInitiator(details) {
-  const initiator = details.initiator || details.documentUrl || "";
-  if (!initiator) return false;
-  return isGameDomain(initiator);
-}
-
-function isTrackerUrl(url) {
-  const lower = url.toLowerCase();
-  return TRACKER_KEYWORDS.some((kw) => lower.includes(kw));
-}
-
-function getCoreExtension(pathname) {
-  const lastSegment = pathname.split("/").pop() || "";
-  const stripped = lastSegment
-    .replace(/\.br$/i, "")
-    .replace(/\.gz$/i, "");
-  const dotIndex = stripped.lastIndexOf(".");
-  if (dotIndex < 0) return "";
-  return stripped.slice(dotIndex + 1).toLowerCase();
-}
-
-function applyHtmlTransforms(rawHtml, gameUrl) {
-  const engine = detectGameEngine();
-  const gameFrameBaseUrl = getBaseUrl(gameUrl);
-  const specialMap = buildSpecialUrlMap(gameUrl);
+async function generateIndexHtml(rawHtml, gameUrl) {
+  const gameBaseUrl = getBaseUrl(gameUrl);
+  const urlMap = buildUrlToLocalMap();
 
   let html = rawHtml;
-  const urlMap = buildUrlToLocalMap();
   html = rewriteAllUrls(html, urlMap);
-  html = rewriteRemainingAbsoluteUrls(html, gameFrameBaseUrl);
+  html = rewriteRemainingAbsoluteUrls(html, gameBaseUrl);
   html = neutralizeTrackers(html);
   html = neutralizeMinigameSdk(html);
-  html = removeDynamicLoaderContent(html, engine);
-  html = injectInterceptor(html, gameFrameBaseUrl, specialMap);
-  return html;
-}
+  html = removeDynamicLoaderContent(html, detectGameEngine());
 
-async function processAndSaveCachedHtml(force = false) {
-  if (!activeSession) return;
-  if (!force && activeSession.htmlCaptured.game) return;
-
-  const cache = activeSession.htmlCache;
-  if (!cache) return;
-
-  const gameUrl = activeSession.htmlCaptured.gameUrl || "";
-
-  console.log(`[minigame-dl] processAndSave: gameCached=${!!cache.gameRawHtml}, force=${force}`);
-
-  if ((!activeSession.htmlCaptured.game || force) && gameUrl && cache.gameRawHtml) {
-    const gameHtml = applyHtmlTransforms(cache.gameRawHtml, gameUrl);
-    await downloadText(`${activeSession.folder}/game.html`, gameHtml, "text/html;charset=utf-8");
-    upsertFile({ type: "entry-html", sourceUrl: gameUrl, localPath: "game.html", status: "ok" });
-    if (!activeSession.htmlCaptured.game) activeSession.stats.downloaded += 1;
-    activeSession.htmlCaptured.game = true;
-    console.log("[minigame-dl] game.html saved from network cache");
+  const scriptTags =
+    '<script src="minigame-sdk-stub.js"></script>\n<script src="interceptor.js"></script>';
+  const headMatch = html.match(/<head[^>]*>/i);
+  if (headMatch) {
+    html = html.replace(headMatch[0], headMatch[0] + "\n" + scriptTags);
+  } else {
+    html = scriptTags + "\n" + html;
   }
 
-  await persistSession();
+  await downloadText(
+    `${activeSession.folder}/index.html`,
+    html,
+    "text/html;charset=utf-8"
+  );
+  upsertFile({
+    type: "entry-html",
+    sourceUrl: gameUrl,
+    localPath: "index.html",
+    status: "ok"
+  });
+  console.log("[minigame-dl] index.html generated");
 }
 
-async function captureFrameHtml() {
-  if (!activeSession) return;
-  if (activeSession.htmlCaptured.game) return;
+async function generateSdkStubFile() {
+  const content = buildSdkStubContent();
+  await downloadText(
+    `${activeSession.folder}/minigame-sdk-stub.js`,
+    content,
+    "text/javascript;charset=utf-8"
+  );
+  upsertFile({
+    type: "compat-script",
+    sourceUrl: "",
+    localPath: "minigame-sdk-stub.js",
+    status: "ok"
+  });
+}
 
-  if (activeSession.htmlCache?.gameRawHtml) {
-    await processAndSaveCachedHtml();
-    if (activeSession.htmlCaptured.game) return;
-  }
+async function generateInterceptorFile() {
+  const content = buildInterceptorContent();
+  await downloadText(
+    `${activeSession.folder}/interceptor.js`,
+    content,
+    "text/javascript;charset=utf-8"
+  );
+  upsertFile({
+    type: "compat-script",
+    sourceUrl: "",
+    localPath: "interceptor.js",
+    status: "ok"
+  });
+}
 
-  console.warn("[minigame-dl] captureFrameHtml: falling back to DOM outerHTML (network cache miss)");
+function buildSdkStubContent() {
+  return `(function() {
+  var _oeSetter = null;
+  Object.defineProperty(window, "onerror", {
+    configurable: true,
+    set: function(fn) { _oeSetter = fn; },
+    get: function() {
+      return function(msg, url, line, col, err) {
+        console.error("[minigame-dl] onerror:", msg, url, line);
+        return true;
+      };
+    }
+  });
 
-  try {
-    const allFrames = await chrome.webNavigation.getAllFrames({ tabId: activeSession.tabId });
-    if (!allFrames || allFrames.length === 0) return;
+  var _noop = function() {};
+  var _pp = function() { return Promise.resolve(); };
+  var _adStub = function() {
+    return Promise.resolve({
+      loadAsync: function() { return Promise.resolve(); },
+      showAsync: function() { return Promise.resolve(); }
+    });
+  };
 
-    let gameFrameId = -1;
-    let gameFrameUrl = activeSession.htmlCaptured.gameUrl || "";
+  var _loadingGone = false;
+  var _loadingIds = [
+    "loading-screen-container", "loader", "loading", "progress-container",
+    "splash", "defold-progress", "unity-loading-bar", "application-splash-wrapper"
+  ];
 
-    for (const frame of allFrames) {
-      const url = frame.url || "";
-      const host = safeHost(url);
-
-      if (GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) {
-        gameFrameId = frame.frameId;
-        if (!gameFrameUrl) gameFrameUrl = url;
-        break;
+  function _hideLoading() {
+    if (_loadingGone) return;
+    var found = false;
+    for (var i = 0; i < _loadingIds.length; i++) {
+      var el = document.querySelector("#" + CSS.escape(_loadingIds[i]) + ":not([data-mg-placeholder])");
+      if (el && el.parentElement) {
+        el.parentElement.removeChild(el);
+        found = true;
       }
     }
+    if (found) {
+      _loadingGone = true;
+      console.log("[minigame-dl] loading overlay removed");
+    }
+  }
 
-    if (gameFrameId < 0) {
-      for (const frame of allFrames) {
-        if (frame.parentFrameId === 0 && frame.frameId !== 0) {
-          const url = frame.url || "";
-          if (url.startsWith("http")) {
-            gameFrameId = frame.frameId;
-            if (!gameFrameUrl) gameFrameUrl = url;
-            break;
-          }
+  var _hlTimer = setInterval(function() {
+    _hideLoading();
+    if (_loadingGone) clearInterval(_hlTimer);
+  }, 2000);
+  setTimeout(function() { clearInterval(_hlTimer); }, 30000);
+
+  window.FBInstant = {
+    initializeAsync: _pp,
+    startGameAsync: _pp,
+    setLoadingProgress: _noop,
+    player: {
+      getID: function() { return "local_player_001"; },
+      getName: function() { return "Local Player"; },
+      getPhoto: function() { return ""; },
+      getDataAsync: function() { return Promise.resolve({}); },
+      setDataAsync: _pp,
+      flushDataAsync: _pp,
+      getStatsAsync: function() { return Promise.resolve({}); },
+      setStatsAsync: _pp,
+      incrementStatsAsync: function() { return Promise.resolve({}); },
+      getConnectedPlayersAsync: function() { return Promise.resolve([]); }
+    },
+    context: {
+      getID: function() { return null; },
+      getType: function() { return "SOLO"; },
+      chooseAsync: _pp,
+      switchAsync: _pp,
+      createAsync: _pp,
+      getPlayersAsync: function() { return Promise.resolve([]); }
+    },
+    getLocale: function() { return "en_US"; },
+    getPlatform: function() { return "WEB"; },
+    getSDKVersion: function() { return "7.1"; },
+    getSupportedAPIs: function() { return ["loadBannerAdAsync","getInterstitialAdAsync","getRewardedVideoAsync"]; },
+    getEntryPointData: function() { return null; },
+    getEntryPointAsync: function() { return Promise.resolve("admin_message"); },
+    logEvent: _noop,
+    shareAsync: _pp,
+    updateAsync: _pp,
+    switchGameAsync: _pp,
+    canCreateShortcutAsync: function() { return Promise.resolve(false); },
+    createShortcutAsync: _pp,
+    getInterstitialAdAsync: _adStub,
+    getRewardedVideoAsync: _adStub,
+    loadBannerAdAsync: _pp,
+    hideBannerAdAsync: _pp,
+    getLeaderboardAsync: function() {
+      return Promise.resolve({
+        setScoreAsync: _pp,
+        getEntriesAsync: function() { return Promise.resolve({ getEntries: function() { return []; } }); },
+        getPlayerEntryAsync: function() { return Promise.resolve(null); },
+        getEntryCountAsync: function() { return Promise.resolve(0); }
+      });
+    },
+    onPause: _noop,
+    quit: _noop
+  };
+  window.minigame = window.FBInstant;
+  window.minigameLoader = window.FBInstant;
+
+  window.MiniGameAds = {
+    showInterstitial: _pp, showRewardedVideo: _pp,
+    showBanner: _pp, hideBanner: _pp,
+    isRewardvideoReady: function() { return true; },
+    isInterstitialReady: function() { return true; },
+    isBannerReady: function() { return false; },
+    load: _noop
+  };
+  window.MinigameAds = window.MiniGameAds;
+  window.MiniGameAnalytics = { init: _noop, onGameEvent: _pp };
+  window.Analytics = window.MiniGameAnalytics;
+  window.MiniGameInfo = { commonInfo: null, init: _pp };
+  window.MiniGameEvent = {
+    init: _noop,
+    onLevelStart: _noop,
+    onLevelFinished: function() { return Promise.resolve(); }
+  };
+  window.minigamePlatform = "minigame";
+  window.minigameConfig = {};
+
+  console.log("[minigame-dl] FBInstant & MiniGame SDK stubs active");
+
+  var _origGBI = Document.prototype.getElementById;
+  Document.prototype.getElementById = function(id) {
+    var el = _origGBI.call(this, id);
+    if (!el) {
+      el = document.createElement("div");
+      el.id = id;
+      el.style.display = "none";
+      el.dataset.mgPlaceholder = "1";
+      if (document.body) document.body.appendChild(el);
+    }
+    return el;
+  };
+})();`;
+}
+
+function buildInterceptorContent() {
+  const knownHosts = new Set(["sdk.minigame.vip", "apps.minigame.vip"]);
+  if (activeSession) {
+    if (activeSession.gameHost) knownHosts.add(activeSession.gameHost);
+    for (const f of activeSession.files) {
+      if (f.status === "ok" && f.sourceUrl) {
+        try { knownHosts.add(new URL(f.sourceUrl).host); } catch {}
+      }
+    }
+  }
+
+  const gameHost = activeSession?.gameHost || "";
+  let gameBasePath = "/";
+  if (activeSession?.gameBaseUrl) {
+    try { gameBasePath = new URL(activeSession.gameBaseUrl).pathname; } catch {}
+  }
+
+  return `(function() {
+  var KH = ${JSON.stringify(Array.from(knownHosts))};
+  var GH = ${JSON.stringify(gameHost)};
+  var GBP = ${JSON.stringify(gameBasePath)};
+
+  function rw(u) {
+    if (!u || u.startsWith("data:") || u.startsWith("blob:")) return u;
+    if (u.includes("minigame-sdk"))
+      return "data:text/javascript,console.log('[minigame-dl] platform sdk blocked')";
+    try {
+      var _rp = (new URL(u, location.href)).pathname;
+      if (_rp.endsWith("/minigame.js") || _rp === "minigame.js")
+        return "data:text/javascript,console.log('[minigame-dl] minigame loader blocked')";
+    } catch (e) {}
+    try {
+      var o = new URL(u, location.href);
+      if (o.protocol !== "http:" && o.protocol !== "https:") return u;
+      if (o.host !== location.host) {
+        if (KH.indexOf(o.host) >= 0) {
+          var p = o.pathname;
+          if (o.host === GH && p.startsWith(GBP)) p = p.substring(GBP.length);
+          else if (p.startsWith("/")) p = p.substring(1);
+          return "./" + p;
         }
       }
-    }
-
-    if (gameFrameId < 0) return;
-
-    if (!activeSession.htmlCaptured.game) {
-      let gameHtml = "";
-      try {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: activeSession.tabId, frameIds: [gameFrameId] },
-          func: () => document.documentElement?.outerHTML || ""
-        });
-        gameHtml = results?.[0]?.result || "";
-      } catch {}
-
-      if (gameHtml && gameHtml.length > 50) {
-        const engine = detectGameEngine();
-        const staleIds = getStaleElementIds(engine);
-        gameHtml = applyHtmlTransforms(gameHtml, gameFrameUrl);
-        gameHtml = removeStaleGameDom(gameHtml, staleIds);
-        await downloadText(`${activeSession.folder}/game.html`, gameHtml, "text/html;charset=utf-8");
-        upsertFile({ type: "entry-html", sourceUrl: gameFrameUrl, localPath: "game.html", status: "ok" });
-        activeSession.htmlCaptured.game = true;
-        activeSession.stats.downloaded += 1;
-      }
-    }
-  } catch (error) {
-    console.warn("captureFrameHtml DOM fallback error:", error);
+    } catch (e) {}
+    return u;
   }
-}
 
-function getBaseUrl(url) {
-  if (!url) return "";
-  const noQuery = url.split("?")[0];
-  const lastSlash = noQuery.lastIndexOf("/");
-  return lastSlash >= 0 ? noQuery.slice(0, lastSlash + 1) : noQuery + "/";
-}
-
-function detectGameEngine() {
-  if (!activeSession) return "unknown";
-  const paths = activeSession.files.map(f => (f.localPath || "").toLowerCase());
-  const urls = activeSession.files.map(f => (f.sourceUrl || "").toLowerCase());
-  const all = paths.concat(urls).join("\n");
-
-  if ((all.includes("/build/") || all.includes("\\build\\")) &&
-      (all.includes(".loader.js") || all.includes(".framework.js") || all.includes(".wasm"))) {
-    return "unity";
-  }
-  if (all.includes("dmloader") || all.includes(".arcd") || all.includes(".dmanifest")) return "defold";
-  if (all.includes("c3runtime") || all.includes("c2runtime")) return "construct";
-  if (all.includes(".pck") || all.includes("/godot")) return "godot";
-  if (all.includes("html5game/")) return "gamemaker";
-  if (all.includes("cocos2d") || all.includes("cocos-js") || all.includes("cc.game")) return "cocos";
-  if (all.includes("phaser")) return "phaser";
-  if (all.includes("pixi")) return "pixi";
-  if (all.includes("playcanvas")) return "playcanvas";
-  if (all.includes("createjs") || all.includes("easeljs")) return "createjs";
-  return "unknown";
-}
-
-function getStaleElementIds(engine) {
-  const BASE = ["loader", "game-container", "spinner", "loading"];
-  const ENGINE_IDS = {
-    unity: ["loader", "game-container", "spinner", "slideshow",
-            "progress-container", "progress-bar", "unity-container",
-            "unity-canvas", "unity-loading-bar", "unity-progress-bar-full"],
-    defold: ["loading-screen-container", "running-from-file-warning"],
-    construct: ["loading", "loader"],
-    godot: ["status", "status-progress", "status-notice"],
-    gamemaker: ["loader"],
-    cocos: [],
-    phaser: [],
-    pixi: [],
-    playcanvas: ["application-splash-wrapper", "progress-bar", "progress"],
-    createjs: ["loader"]
+  var F = window.fetch;
+  window.fetch = function(i, o) {
+    if (typeof i === "string") i = rw(i);
+    else if (i && i.url) { var n = rw(i.url); if (n !== i.url) i = new Request(n, i); }
+    return F.call(this, i, o);
   };
-  const ids = new Set(BASE);
-  for (const id of (ENGINE_IDS[engine] || [])) ids.add(id);
-  return Array.from(ids);
+
+  var X = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function() {
+    var a = [].slice.call(arguments);
+    if (typeof a[1] === "string") a[1] = rw(a[1]);
+    return X.apply(this, a);
+  };
+
+  var SA = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(n, v) {
+    if ((n === "src" || n === "href") && typeof v === "string") v = rw(v);
+    return SA.call(this, n, v);
+  };
+
+  function patchSrc(P) {
+    try {
+      var d = Object.getOwnPropertyDescriptor(P, "src");
+      if (d && d.set) Object.defineProperty(P, "src", {
+        set: function(v) { d.set.call(this, rw(v)); },
+        get: d.get,
+        configurable: true
+      });
+    } catch (e) {}
+  }
+  patchSrc(HTMLScriptElement.prototype);
+  patchSrc(HTMLImageElement.prototype);
+  patchSrc(HTMLIFrameElement.prototype);
+  patchSrc(HTMLSourceElement.prototype);
+  patchSrc(HTMLMediaElement.prototype);
+
+  function rwCss(s) {
+    return s.replace(/url\\(\\s*(["']?)([^"')]+?)\\1\\s*\\)/gi, function(m, q, p) {
+      return "url(" + q + rw(p) + q + ")";
+    });
+  }
+
+  if (window.FontFace) {
+    var OF = window.FontFace;
+    window.FontFace = function(f, s, d) {
+      if (typeof s === "string") s = rwCss(s);
+      return new OF(f, s, d);
+    };
+    window.FontFace.prototype = OF.prototype;
+  }
+
+  try {
+    var IR = CSSStyleSheet.prototype.insertRule;
+    CSSStyleSheet.prototype.insertRule = function(r, i) {
+      return IR.call(this, rwCss(r), i);
+    };
+  } catch (e) {}
+
+  try {
+    var dI = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+    if (dI && dI.set) Object.defineProperty(Element.prototype, "innerHTML", {
+      set: function(v) {
+        if (this.tagName === "STYLE" && typeof v === "string") v = rwCss(v);
+        dI.set.call(this, v);
+      },
+      get: dI.get,
+      configurable: true
+    });
+  } catch (e) {}
+
+  try {
+    var dT = Object.getOwnPropertyDescriptor(Node.prototype, "textContent");
+    if (dT && dT.set) {
+      var origTC = dT.set;
+      Object.defineProperty(Node.prototype, "textContent", {
+        set: function(v) {
+          if (this.tagName === "STYLE" && typeof v === "string") v = rwCss(v);
+          origTC.call(this, v);
+        },
+        get: dT.get,
+        configurable: true
+      });
+    }
+  } catch (e) {}
+
+  console.log("[minigame-dl] interceptor active, knownHosts:", KH.length, "gameHost:", GH);
+})();`;
 }
+
+/* ── URL rewriting ─────────────────────────────────────────── */
 
 function buildUrlToLocalMap() {
   const map = new Map();
@@ -690,20 +881,20 @@ function rewriteAllUrls(html, urlToLocal) {
   return result;
 }
 
-function rewriteRemainingAbsoluteUrls(html, gameFrameBaseUrl) {
+function rewriteRemainingAbsoluteUrls(html, gameBaseUrl) {
   if (!activeSession) return html;
-  const hosts = new Set();
+  const hosts = new Set(["sdk.minigame.vip", "apps.minigame.vip"]);
+  if (activeSession.gameHost) hosts.add(activeSession.gameHost);
   for (const file of activeSession.files) {
     if (file.status !== "ok" || !file.sourceUrl) continue;
     try { hosts.add(new URL(file.sourceUrl).host); } catch {}
   }
-  for (const d of GAME_DOMAIN_EXACT) hosts.add(d);
 
   let gameBasePathname = "";
   let gameHost = "";
-  if (gameFrameBaseUrl) {
+  if (gameBaseUrl) {
     try {
-      const u = new URL(gameFrameBaseUrl);
+      const u = new URL(gameBaseUrl);
       gameHost = u.host;
       gameBasePathname = u.pathname;
     } catch {}
@@ -715,7 +906,7 @@ function rewriteRemainingAbsoluteUrls(html, gameFrameBaseUrl) {
       const originSlash = origin + "/";
       if (!html.includes(originSlash) && !html.includes(origin.replace(/\//g, "\\/"))) continue;
 
-      const basePath = (host === gameHost) ? gameBasePathname : "/";
+      const basePath = host === gameHost ? gameBasePathname : "/";
 
       if (html.includes(originSlash)) {
         html = html.split(origin + basePath).join("./");
@@ -736,16 +927,6 @@ function rewriteRemainingAbsoluteUrls(html, gameFrameBaseUrl) {
   return html;
 }
 
-function buildSpecialUrlMap(gameFrameUrl) {
-  const map = {};
-  if (!gameFrameUrl) return map;
-  try {
-    const url = new URL(gameFrameUrl.split("?")[0]);
-    map[url.host + url.pathname] = "./game.html";
-  } catch {}
-  return map;
-}
-
 function neutralizeTrackers(html) {
   html = html.replace(/<script[^>]*src="[^"]*googletagmanager[^"]*"[^>]*><\/script>/gi, "");
   html = html.replace(/<script[^>]*src="[^"]*google-analytics[^"]*"[^>]*><\/script>/gi, "");
@@ -755,21 +936,11 @@ function neutralizeTrackers(html) {
 }
 
 function neutralizeMinigameSdk(html) {
-  html = html.replace(
-    /<script[^>]*src="[^"]*minigame-sdk[^"]*"[^>]*><\/script>/gi, ""
-  );
-
-  html = html.replace(
-    /var\s+sdkName\s*=\s*["']FaceBook["']\s*;/g,
-    `var sdkName = "FaceBookTest";`
-  );
-
-  html = html.replace(
-    /<script[^>]*src="[^"]*\/minigame\.js"[^>]*><\/script>/gi, ""
-  );
-
-  html = stripMinigameAdapterScript(html);
-  return html;
+  html = html.replace(/<script[^>]*src="[^"]*minigame-sdk[^"]*"[^>]*><\/script>/gi, "");
+  html = html.replace(/var\s+sdkName\s*=\s*["']FaceBook["']\s*;/g, `var sdkName = "FaceBookTest";`);
+  html = html.replace(/<script[^>]*src="[^"]*\/minigame\.js[^"]*"[^>]*><\/script>/gi, "");
+  html = html.replace(/<script[^>]*src="[^"]*sdk\.minigame\.vip[^"]*"[^>]*><\/script>/gi, "");
+  return stripMinigameAdapterScript(html);
 }
 
 function stripMinigameAdapterScript(html) {
@@ -787,356 +958,53 @@ function stripMinigameAdapterScript(html) {
 
 function removeDynamicLoaderContent(html, engine) {
   html = html.replace(/<!--\s*will\s+(be\s+copied|also\s+be\s+copied)\s+to\s+the\s+resulting\s+body\s*\/?\/?-->/gi, "");
-
-  if (engine === "construct") {
-    html = html.replace(/<script[^>]*src="[^"]*sw\.js"[^>]*><\/script>/gi, "");
-  }
-
+  html = html.replace(/<script[^>]*src="[^"]*sw\.js"[^>]*><\/script>/gi, "");
   if (engine === "godot") {
     html = html.replace(/<script[^>]*src="[^"]*godot\.tools\.js"[^>]*><\/script>/gi, "");
   }
-
   return html;
 }
 
-function removeStaleGameDom(html, staleIds) {
-  for (const id of staleIds) {
-    let safety = 20;
-    while (safety-- > 0) {
-      const next = stripFirstDivById(html, id);
-      if (next === html) break;
-      html = next;
-    }
-  }
-  return html;
+function detectGameEngine() {
+  if (!activeSession) return "unknown";
+  const paths = activeSession.files.map((f) => (f.localPath || "").toLowerCase());
+  const urls = activeSession.files.map((f) => (f.sourceUrl || "").toLowerCase());
+  const all = paths.concat(urls).join("\n");
+
+  if ((all.includes("/build/") || all.includes("\\build\\")) &&
+      (all.includes(".loader.js") || all.includes(".framework.js") || all.includes(".wasm")))
+    return "unity";
+  if (all.includes("dmloader") || all.includes(".arcd") || all.includes(".dmanifest")) return "defold";
+  if (all.includes("c3runtime") || all.includes("c2runtime")) return "construct";
+  if (all.includes(".pck") || all.includes("/godot")) return "godot";
+  if (all.includes("html5game/")) return "gamemaker";
+  if (all.includes("cocos2d") || all.includes("cocos-js") || all.includes("cc.game")) return "cocos";
+  if (all.includes("phaser")) return "phaser";
+  if (all.includes("pixi")) return "pixi";
+  if (all.includes("playcanvas")) return "playcanvas";
+  if (all.includes("createjs") || all.includes("easeljs")) return "createjs";
+  return "unknown";
 }
 
-function isInsideScriptBlock(html, pos) {
-  const before = html.slice(0, pos);
-  const lastOpen = before.lastIndexOf("<script");
-  if (lastOpen < 0) return false;
-  const lastClose = before.lastIndexOf("</script");
-  return lastOpen > lastClose;
-}
-
-function stripFirstDivById(html, id) {
-  const marker = new RegExp(`<div\\b[^>]*\\bid\\s*=\\s*["']${id}["']`, "ig");
-  let match;
-  while ((match = marker.exec(html)) !== null) {
-    if (isInsideScriptBlock(html, match.index)) continue;
-
-    const start = match.index;
-    let depth = 0;
-    let i = start;
-
-    while (i < html.length) {
-      if (html[i] !== "<") { i++; continue; }
-      const chunk = html.slice(i, i + 6).toLowerCase();
-      if (chunk.startsWith("<div")) {
-        depth++;
-        i = html.indexOf(">", i);
-        if (i < 0) return html;
-        i++;
-      } else if (chunk.startsWith("</div")) {
-        depth--;
-        const end = html.indexOf(">", i);
-        if (end < 0) return html;
-        if (depth === 0) return html.slice(0, start) + html.slice(end + 1);
-        i = end + 1;
-      } else {
-        i++;
-      }
-    }
-  }
-  return html;
-}
-
-function buildInterceptorScript(gameFrameBaseUrl, specialMap) {
-  const knownHosts = new Set(GAME_DOMAIN_EXACT);
-  if (activeSession) {
-    for (const f of activeSession.files) {
-      if (f.status === "ok" && f.sourceUrl) {
-        try { knownHosts.add(new URL(f.sourceUrl).host); } catch {}
-      }
-    }
-  }
-
-  let gameHost = "", gameBasePath = "/";
-  if (gameFrameBaseUrl) {
-    try {
-      const u = new URL(gameFrameBaseUrl);
-      gameHost = u.host;
-      gameBasePath = u.pathname;
-    } catch {}
-  }
-
-  const onerrorSafety = `
-    (function() {
-      var _oeSetter = null;
-      Object.defineProperty(window, "onerror", {
-        configurable: true,
-        set: function(fn) { _oeSetter = fn; },
-        get: function() {
-          return function(msg, url, line, col, err) {
-            console.error("[minigame-dl] onerror:", msg, url, line);
-            return true;
-          };
-        }
-      });
-    })();
-  `;
-
-  const adInstanceStub =
-    `{loadAsync:function(){return Promise.resolve()},` +
-    `showAsync:function(){return Promise.resolve()}}`;
-
-  const sdkStub = `
-    var _noop = function() {};
-    var _pp = function() { return Promise.resolve(); };
-    var _adStub = function() { return Promise.resolve(${adInstanceStub}); };
-
-    var _loadingGone = false;
-    var _loadingIds = [
-      "loading-screen-container", "loader", "loading", "progress-container",
-      "splash", "defold-progress", "unity-loading-bar", "application-splash-wrapper"
-    ];
-
-    function _hideLoading() {
-      if (_loadingGone) return;
-      var found = false;
-
-      for (var i = 0; i < _loadingIds.length; i++) {
-        var el = document.querySelector("#" + CSS.escape(_loadingIds[i]) + ":not([data-mg-placeholder])");
-        if (el && el.parentElement) {
-          el.parentElement.removeChild(el);
-          found = true;
-        }
-      }
-
-      if (found) {
-        _loadingGone = true;
-        console.log("[minigame-dl] loading overlay removed");
-      }
-    }
-
-    var _hlTimer = setInterval(function() {
-      _hideLoading();
-      if (_loadingGone) clearInterval(_hlTimer);
-    }, 2000);
-    setTimeout(function() { clearInterval(_hlTimer); }, 30000);
-
-    window.FBInstant = {
-      initializeAsync: _pp,
-      startGameAsync: _pp,
-      setLoadingProgress: _noop,
-      player: {
-        getID: function() { return "local_player_001"; },
-        getName: function() { return "Local Player"; },
-        getPhoto: function() { return ""; },
-        getDataAsync: function() { return Promise.resolve({}); },
-        setDataAsync: _pp,
-        flushDataAsync: _pp,
-        getStatsAsync: function() { return Promise.resolve({}); },
-        setStatsAsync: _pp,
-        incrementStatsAsync: function() { return Promise.resolve({}); },
-        getConnectedPlayersAsync: function() { return Promise.resolve([]); }
-      },
-      context: {
-        getID: function() { return null; },
-        getType: function() { return "SOLO"; },
-        chooseAsync: _pp,
-        switchAsync: _pp,
-        createAsync: _pp,
-        getPlayersAsync: function() { return Promise.resolve([]); }
-      },
-      getLocale: function() { return "en_US"; },
-      getPlatform: function() { return "WEB"; },
-      getSDKVersion: function() { return "7.1"; },
-      getSupportedAPIs: function() { return ["loadBannerAdAsync","getInterstitialAdAsync","getRewardedVideoAsync"]; },
-      getEntryPointData: function() { return null; },
-      getEntryPointAsync: function() { return Promise.resolve("admin_message"); },
-      logEvent: _noop,
-      shareAsync: _pp,
-      updateAsync: _pp,
-      switchGameAsync: _pp,
-      canCreateShortcutAsync: function() { return Promise.resolve(false); },
-      createShortcutAsync: _pp,
-      getInterstitialAdAsync: _adStub,
-      getRewardedVideoAsync: _adStub,
-      loadBannerAdAsync: _pp,
-      hideBannerAdAsync: _pp,
-      getLeaderboardAsync: function() {
-        return Promise.resolve({
-          setScoreAsync: _pp,
-          getEntriesAsync: function() { return Promise.resolve({ getEntries: function() { return []; } }); },
-          getPlayerEntryAsync: function() { return Promise.resolve(null); },
-          getEntryCountAsync: function() { return Promise.resolve(0); }
-        });
-      },
-      onPause: _noop,
-      quit: _noop
-    };
-    window.minigame = window.FBInstant;
-    window.minigameLoader = window.FBInstant;
-    window.MiniGameAds = {
-      showInterstitial: _pp, showRewardedVideo: _pp,
-      showBanner: _pp, hideBanner: _pp,
-      isRewardvideoReady: function() { return false; },
-      isInterstitialReady: function() { return false; },
-      isBannerReady: function() { return false; },
-      load: _noop
-    };
-    window.MinigameAds = window.MiniGameAds;
-    window.MiniGameAnalytics = { init: _noop, onGameEvent: _pp };
-    window.Analytics = window.MiniGameAnalytics;
-    window.MiniGameInfo = { commonInfo: null, init: _pp };
-
-    console.log("[minigame-dl] FBInstant & MiniGame SDK stubs active");
-  `;
-
-  const domSafety = `
-    var _origGBI = Document.prototype.getElementById;
-    Document.prototype.getElementById = function(id) {
-      var el = _origGBI.call(this, id);
-      if (!el) {
-        el = document.createElement("div");
-        el.id = id;
-        el.style.display = "none";
-        el.dataset.mgPlaceholder = "1";
-        if (document.body) document.body.appendChild(el);
-      }
-      return el;
-    };
-  `;
-
-  return `<script>(function(){` +
-    onerrorSafety +
-    sdkStub +
-    domSafety +
-    `var KH=${JSON.stringify(Array.from(knownHosts))};` +
-    `var GH=${JSON.stringify(gameHost)};` +
-    `var GBP=${JSON.stringify(gameBasePath)};` +
-    `var S=${JSON.stringify(specialMap || {})};` +
-    `var PD=location.pathname.substring(0,location.pathname.lastIndexOf("/")+1);` +
-    `function rw(u){` +
-      `if(!u||u.startsWith("data:")||u.startsWith("blob:"))return u;` +
-      `if(u.includes("minigame-sdk"))` +
-        `return"data:text/javascript,console.log('[minigame-dl] platform sdk blocked')";` +
-      `try{var _rp=(new URL(u,location.href)).pathname;` +
-        `if(_rp.endsWith("/minigame.js")||_rp==="minigame.js")` +
-          `return"data:text/javascript,console.log('[minigame-dl] minigame loader blocked')";}catch(e){}` +
-      `try{var o=new URL(u,location.href);` +
-        `if(o.protocol!=="http:"&&o.protocol!=="https:")return u;` +
-        `if(o.host!==location.host){` +
-          `var sk=o.host+o.pathname;if(S[sk])return S[sk];` +
-          `if(KH.indexOf(o.host)>=0){` +
-            `var p=o.pathname;` +
-            `if(o.host===GH&&p.startsWith(GBP))p=p.substring(GBP.length);` +
-            `else if(p.startsWith("/"))p=p.substring(1);` +
-            `return"./"+p;}}` +
-      `}catch(e){}return u;}` +
-    `var F=window.fetch;` +
-    `window.fetch=function(i,o){` +
-      `if(typeof i==="string")i=rw(i);` +
-      `else if(i&&i.url){var n=rw(i.url);if(n!==i.url)i=new Request(n,i);}` +
-      `return F.call(this,i,o);};` +
-    `var X=XMLHttpRequest.prototype.open;` +
-    `XMLHttpRequest.prototype.open=function(){` +
-      `var a=[].slice.call(arguments);` +
-      `if(typeof a[1]==="string")a[1]=rw(a[1]);` +
-      `return X.apply(this,a);};` +
-    `var SA=Element.prototype.setAttribute;` +
-    `Element.prototype.setAttribute=function(n,v){` +
-      `if((n==="src"||n==="href")&&typeof v==="string")v=rw(v);` +
-      `return SA.call(this,n,v);};` +
-    `function patchSrc(P){try{var d=Object.getOwnPropertyDescriptor(P,"src");` +
-      `if(d&&d.set)Object.defineProperty(P,"src",{` +
-        `set:function(v){d.set.call(this,rw(v));},get:d.get,configurable:true});}catch(e){}}` +
-    `patchSrc(HTMLScriptElement.prototype);` +
-    `patchSrc(HTMLImageElement.prototype);` +
-    `patchSrc(HTMLIFrameElement.prototype);` +
-    `patchSrc(HTMLSourceElement.prototype);` +
-    `patchSrc(HTMLMediaElement.prototype);` +
-    `function rwCss(s){return s.replace(/url\\(\\s*(["']?)([^"')]+?)\\1\\s*\\)/gi,` +
-      `function(m,q,p){return"url("+q+rw(p)+q+")";});}` +
-    `if(window.FontFace){var OF=window.FontFace;` +
-      `window.FontFace=function(f,s,d){` +
-        `if(typeof s==="string")s=rwCss(s);` +
-        `return new OF(f,s,d);};` +
-      `window.FontFace.prototype=OF.prototype;}` +
-    `try{var IR=CSSStyleSheet.prototype.insertRule;` +
-      `CSSStyleSheet.prototype.insertRule=function(r,i){` +
-        `return IR.call(this,rwCss(r),i);};}catch(e){}` +
-    `try{var dI=Object.getOwnPropertyDescriptor(Element.prototype,"innerHTML");` +
-      `if(dI&&dI.set)Object.defineProperty(Element.prototype,"innerHTML",{` +
-        `set:function(v){if(this.tagName==="STYLE"&&typeof v==="string")v=rwCss(v);` +
-          `dI.set.call(this,v);},get:dI.get,configurable:true});}catch(e){}` +
-    `try{var dT=Object.getOwnPropertyDescriptor(Node.prototype,"textContent");` +
-      `if(dT&&dT.set){var origTC=dT.set;Object.defineProperty(Node.prototype,"textContent",{` +
-        `set:function(v){if(this.tagName==="STYLE"&&typeof v==="string")v=rwCss(v);` +
-          `origTC.call(this,v);},get:dT.get,configurable:true});}}catch(e){}` +
-    `console.log("[minigame-dl] interceptor active, knownHosts:",KH.length,"gameHost:",GH);` +
-  `})();</script>`;
-}
-
-function injectInterceptor(html, gameFrameBaseUrl, specialMap) {
-  const script = buildInterceptorScript(gameFrameBaseUrl, specialMap);
-  const headMatch = html.match(/<head[^>]*>/i);
-  if (headMatch) {
-    return html.replace(headMatch[0], headMatch[0] + script);
-  }
-  return script + html;
-}
-
-async function getPageInfoFromTab(tabId) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const pathMatch = window.location.pathname.match(/\/game\/([^/?#]+)/);
-      return {
-        pageUrl: window.location.href,
-        gameName: pathMatch ? decodeURIComponent(pathMatch[1]) : document.title || "mini-game"
-      };
-    }
-  });
-  return results?.[0]?.result || null;
-}
-
-function tryInferGameUrl(url) {
-  const host = safeHost(url);
-  if (!GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) return;
-  try {
-    const u = new URL(url);
-    const segments = u.pathname.split("/").filter(Boolean);
-    if (segments.length >= 2) {
-      const inferred = `${u.origin}/${segments[0]}/index.html`;
-      activeSession.htmlCaptured.gameUrl = inferred;
-      console.log(`[mini-dl] gameUrl inferred from asset: ${inferred}`);
-    }
-  } catch {}
-}
+/* ── Path utilities ────────────────────────────────────────── */
 
 function urlToLocalPath(urlString) {
   const url = new URL(urlString);
   let pathname = url.pathname;
 
-  if (activeSession?.htmlCaptured?.gameUrl) {
+  if (activeSession?.gameBaseUrl) {
     try {
-      const gameBase = getBaseUrl(activeSession.htmlCaptured.gameUrl);
-      const gameU = new URL(gameBase);
-      if (url.host === gameU.host && pathname.startsWith(gameU.pathname)) {
-        pathname = pathname.slice(gameU.pathname.length);
+      const baseU = new URL(activeSession.gameBaseUrl);
+      if (url.host === baseU.host && pathname.startsWith(baseU.pathname)) {
+        pathname = pathname.slice(baseU.pathname.length);
       }
     } catch {}
   }
 
-  if (pathname === url.pathname) {
-    const host = safeHost(urlString);
-    if (GAME_DOMAIN_SUFFIXES.some((s) => host.endsWith(s))) {
-      const segs = pathname.split("/").filter(Boolean);
-      if (segs.length >= 2) {
-        pathname = "/" + segs.slice(1).join("/");
-      }
+  if (pathname === url.pathname && activeSession?.gameHost === url.host) {
+    const segs = pathname.split("/").filter(Boolean);
+    if (segs.length >= 2) {
+      pathname = "/" + segs.slice(1).join("/");
     }
   }
 
@@ -1149,6 +1017,13 @@ function urlToLocalPath(urlString) {
   return filePath;
 }
 
+function getBaseUrl(url) {
+  if (!url) return "";
+  const noQuery = url.split("?")[0];
+  const lastSlash = noQuery.lastIndexOf("/");
+  return lastSlash >= 0 ? noQuery.slice(0, lastSlash + 1) : noQuery + "/";
+}
+
 function appendSuffix(path, suffix) {
   const lastSlash = path.lastIndexOf("/");
   const dir = lastSlash >= 0 ? path.slice(0, lastSlash + 1) : "";
@@ -1159,11 +1034,7 @@ function appendSuffix(path, suffix) {
 }
 
 function sanitizeName(input) {
-  return String(input)
-    .trim()
-    .replace(/[/\\?%*:|"<>]/g, "_")
-    .replace(/\s+/g, "_")
-    .slice(0, 120);
+  return String(input).trim().replace(/[/\\?%*:|"<>]/g, "_").replace(/\s+/g, "_").slice(0, 120);
 }
 
 function simpleHash(input) {
@@ -1174,24 +1045,24 @@ function simpleHash(input) {
   return Math.abs(h).toString(16);
 }
 
-function safePathname(urlString) {
-  try { return new URL(urlString).pathname; } catch { return ""; }
-}
-
 function safeHost(urlString) {
   try { return new URL(urlString).host; } catch { return ""; }
 }
+
+function isTrackerUrl(url) {
+  const lower = url.toLowerCase();
+  return TRACKER_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+/* ── Download helpers ──────────────────────────────────────── */
 
 async function downloadUrl(url, filename) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
       { url, filename, conflictAction: "overwrite", saveAs: false },
       (downloadId) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-        } else {
-          resolve(downloadId);
-        }
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(downloadId);
       }
     );
   });
@@ -1208,11 +1079,8 @@ async function downloadText(filename, textContent, mimeType) {
     chrome.downloads.download(
       { url: dataUrl, filename, conflictAction: "overwrite", saveAs: false },
       (downloadId) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-        } else {
-          resolve(downloadId);
-        }
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(downloadId);
       }
     );
   });
@@ -1230,6 +1098,8 @@ function upsertFile(record) {
   }
 }
 
+/* ── Status & badge ────────────────────────────────────────── */
+
 function buildStatusPayload() {
   if (!activeSession) return { status: "idle" };
   return {
@@ -1238,10 +1108,12 @@ function buildStatusPayload() {
     folder: activeSession.folder,
     stats: activeSession.stats,
     fileCount: activeSession.files.length,
-    htmlStatus: {
-      gameHtml: activeSession.htmlCaptured.game,
-      gameCached: !!activeSession.htmlCache?.gameRawHtml
-    }
+    gameDetected: !!activeSession.gameHost,
+    gameHost: activeSession.gameHost || "",
+    htmlCaptured: activeSession.htmlCaptured,
+    networkCacheSize: networkHtmlCache.size,
+    debuggerAttached,
+    bufferSize: requestBuffer.length
   };
 }
 
@@ -1251,6 +1123,8 @@ async function updateBadgeCount() {
   const text = count > 999 ? "999+" : String(count);
   await chrome.action.setBadgeText({ tabId: activeSession.tabId, text });
 }
+
+/* ── Session persistence ───────────────────────────────────── */
 
 function schedulePersist() {
   if (persistTimer) return;
@@ -1277,11 +1151,13 @@ async function persistSession() {
     pageUrl: activeSession.pageUrl,
     startedAt: activeSession.startedAt,
     status: activeSession.status,
+    gameHost: activeSession.gameHost,
+    gameUrl: activeSession.gameUrl,
+    gameBaseUrl: activeSession.gameBaseUrl,
     stats: activeSession.stats,
     seenUrlsList: Array.from(activeSession.seenUrls),
     files: activeSession.files,
     htmlCaptured: activeSession.htmlCaptured
-    // htmlCache intentionally omitted — raw HTML can be large; re-captured on page reload
   };
   await chrome.storage.local.set({ activeSession: serializable });
 }
@@ -1295,13 +1171,15 @@ async function restoreSession() {
     activeSession = {
       ...saved,
       seenUrls: new Set(saved.seenUrlsList || []),
-      pending: new Set(),
-      htmlCache: saved.htmlCache || { gameRawHtml: null }
+      pending: new Set()
     };
     delete activeSession.seenUrlsList;
 
     if (activeSession.tabId) {
       void attachDebugger(activeSession.tabId);
+      if (!activeSession.gameHost) {
+        startPlayIframeDetection(activeSession.tabId);
+      }
     }
 
     await chrome.action.setBadgeBackgroundColor({ tabId: activeSession.tabId, color: "#10b981" });
@@ -1316,6 +1194,7 @@ async function writeManifest() {
   const payload = {
     gameName: activeSession.gameName,
     pageUrl: activeSession.pageUrl,
+    gameUrl: activeSession.gameUrl || "",
     engine: detectGameEngine(),
     startedAt: activeSession.startedAt,
     stoppedAt: activeSession.stoppedAt || "",
@@ -1328,4 +1207,20 @@ async function writeManifest() {
     JSON.stringify(payload, null, 2),
     "application/json;charset=utf-8"
   );
+}
+
+/* ── Page info ─────────────────────────────────────────────── */
+
+async function getPageInfoFromTab(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const pathMatch = window.location.pathname.match(/\/game\/([^/?#]+)/);
+      return {
+        pageUrl: window.location.href,
+        gameName: pathMatch ? decodeURIComponent(pathMatch[1]) : document.title || "mini-game"
+      };
+    }
+  });
+  return results?.[0]?.result || null;
 }
