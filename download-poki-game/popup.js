@@ -37,23 +37,24 @@ function renderStatus(result) {
   }
 
   const s = result.stats || {};
-  const h = result.htmlStatus || {};
-  const htmlLine = [
-    h.gameHtml ? "game.html ✓" : "game.html ✗",
-    h.indexHtml ? "index.html ✓" : "index.html ✗"
-  ].join("  ");
+  const gameLine = result.gameDetected
+    ? `游戏域名: ${result.gameHost}`
+    : "游戏检测: 等待中...";
+  const htmlLine = result.htmlCaptured ? "index.html ✓" : "index.html ✗";
   const lines = [
-    `状态: 监听中`,
+    "状态: 监听中",
     `游戏: ${result.gameName}`,
+    gameLine,
     `已下载: ${s.downloaded || 0}`,
     `失败: ${s.failed || 0}`,
     `总请求: ${s.totalSeen || 0}`,
     `文件数: ${result.fileCount || 0}`,
     `HTML: ${htmlLine}`,
-    `网络缓存: ${h.networkCacheSize || 0} 条${h.debuggerAttached ? "" : " (调试器未连接!)"}`,
+    `网络缓存: ${result.networkCacheSize || 0} 条${result.debuggerAttached ? "" : " (调试器未连接!)"}`,
+    result.gameDetected ? "" : `缓冲队列: ${result.bufferSize || 0} 条`,
     `目录: ${result.folder}/`
   ];
-  setStatus(lines.join("\n"));
+  setStatus(lines.filter(Boolean).join("\n"));
   updateButtons("listening");
 }
 
@@ -94,7 +95,7 @@ startBtn.addEventListener("click", async () => {
     if (!result.ok) throw new Error(result.error || "开启监听失败。");
 
     setStatus(
-      `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/\n\n请现在刷新页面，进入游戏。\n游戏完全加载后，点击「抓取页面 HTML」。`
+      `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/\n\n请现在刷新页面，进入游戏。\n检测到游戏后资源将自动下载。`
     );
     updateButtons("listening");
   } catch (error) {
@@ -105,7 +106,7 @@ startBtn.addEventListener("click", async () => {
 
 captureBtn.addEventListener("click", async () => {
   captureBtn.disabled = true;
-  captureBtn.textContent = "正在抓取...";
+  captureBtn.textContent = "正在生成...";
 
   try {
     const tab = await getActiveTab();
@@ -117,17 +118,13 @@ captureBtn.addEventListener("click", async () => {
     });
 
     if (!result) throw new Error("后台无响应。");
-    if (!result.ok) throw new Error(result.error || "抓取失败。");
+    if (!result.ok) throw new Error(result.error || "生成失败。");
 
-    if (result.errors?.length) {
-      setStatus(`部分抓取成功:\n${result.message}`);
-    } else {
-      setStatus(`抓取成功！\n${result.message}`);
-    }
+    setStatus(`生成成功！\n${result.message}`);
   } catch (error) {
-    setStatus(`抓取失败: ${error.message}`);
+    setStatus(`生成失败: ${error.message}`);
   } finally {
-    captureBtn.textContent = "抓取页面 HTML（游戏加载后点）";
+    captureBtn.textContent = "生成 HTML（游戏加载后点）";
     captureBtn.disabled = false;
   }
 });
