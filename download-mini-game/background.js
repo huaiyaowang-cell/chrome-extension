@@ -611,6 +611,18 @@ function buildSdkStubContent() {
     });
   };
 
+  var _fbStorageKey = "minigame_dl_fbinstant_player_data";
+  function _fbGetData() {
+    try { var s = localStorage.getItem(_fbStorageKey); return s ? JSON.parse(s) : {}; } catch (e) { return {}; }
+  }
+  function _fbSetData(obj) {
+    try {
+      var cur = _fbGetData();
+      for (var k in obj) if (Object.prototype.hasOwnProperty.call(obj, k)) cur[k] = obj[k];
+      localStorage.setItem(_fbStorageKey, JSON.stringify(cur));
+    } catch (e) {}
+  }
+
   var _loadingGone = false;
   var _loadingIds = [
     "loading-screen-container", "loader", "loading", "progress-container",
@@ -647,13 +659,15 @@ function buildSdkStubContent() {
       getID: function() { return "local_player_001"; },
       getName: function() { return "Local Player"; },
       getPhoto: function() { return ""; },
-      getDataAsync: function() { return Promise.resolve({}); },
-      setDataAsync: _pp,
+      getDataAsync: function(keys) { return Promise.resolve(_fbGetData()); },
+      setDataAsync: function(data) { _fbSetData(data); return Promise.resolve(); },
       flushDataAsync: _pp,
       getStatsAsync: function() { return Promise.resolve({}); },
       setStatsAsync: _pp,
       incrementStatsAsync: function() { return Promise.resolve({}); },
-      getConnectedPlayersAsync: function() { return Promise.resolve([]); }
+      getConnectedPlayersAsync: function() { return Promise.resolve([]); },
+      canSubscribeBotAsync: function() { return Promise.resolve(false); },
+      subscribeBotAsync: function() { return Promise.resolve(); }
     },
     context: {
       getID: function() { return null; },
@@ -713,6 +727,12 @@ function buildSdkStubContent() {
   window.minigamePlatform = "minigame";
   window.minigameConfig = {};
 
+  /* Cocos/minigame analytics/bug-report stub (e.g. sendBugLog.bugInfoHttp / updateGameErrorType) */
+  window.sendBugLog = {
+    bugInfoHttp: _noop,
+    updateGameErrorType: _noop
+  };
+
   console.log("[minigame-dl] FBInstant & MiniGame SDK stubs active");
 
   var _origGBI = Document.prototype.getElementById;
@@ -727,6 +747,15 @@ function buildSdkStubContent() {
     }
     return el;
   };
+
+  /* Cocos/FB Instant: pages may use sdkName/loading vars without defining (e.g. set by stripped adapter) */
+  if (typeof window.sdkName === "undefined") window.sdkName = "FaceBook";
+  if (typeof window.gameServerVersion === "undefined") window.gameServerVersion = "1.0.0";
+  if (typeof window.loadProgress === "undefined") window.loadProgress = 0;
+  if (typeof window.loadRealProgress === "undefined") window.loadRealProgress = 0;
+  if (typeof window.isLoadComplete === "undefined") window.isLoadComplete = false;
+  if (typeof window.updateProgress === "undefined") window.updateProgress = null;
+  if (typeof window.facebookPlayerid === "undefined") window.facebookPlayerid = null;
 })();`;
 }
 
@@ -971,6 +1000,17 @@ function neutralizeMinigameSdk(html) {
   html = html.replace(/var\s+sdkName\s*=\s*["']FaceBook["']\s*;/g, `var sdkName = "FaceBookTest";`);
   html = html.replace(/<script[^>]*src="[^"]*\/minigame\.js[^"]*"[^>]*><\/script>/gi, "");
   html = html.replace(/<script[^>]*src="[^"]*sdk\.minigame\.vip[^"]*"[^>]*><\/script>/gi, "");
+  /* Cocos/FB: run FB branch without loading ./js/1.0/minigame-sdk.js (not captured); stub provides FBInstant */
+  if (html.includes("loadJs(\"./js/1.0/minigame-sdk.js\"") || html.includes("loadJs('./js/1.0/minigame-sdk.js'")) {
+    html = html.replace(
+      /loadJs\s*\(\s*["']\.\/js\/1\.0\/minigame-sdk\.js["'][\s\S]*?function\s*\(\s*\)\s*\{/g,
+      "(function(){"
+    );
+    html = html.replace(
+      /\}\s*\)\s*;\s*\}\s*\)\s*;\s*(\s*if\s*\(\s*sdkName\s*==\s*["']FaceBookTest["']\s*\)\s*\{)/g,
+      "}); })();$1"
+    );
+  }
   return stripMinigameAdapterScript(html);
 }
 

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Fix Game Resources (404 补全)",
+  "version": "1.0.0",
+  "description": "监听游戏页面 404 资源，从游戏域名拉取并保存到本地下载目录。支持 minigame / poki 等本地运行的游戏。",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "storage",
+    "tabs",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "补全 404 资源"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

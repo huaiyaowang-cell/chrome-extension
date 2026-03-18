@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>补全 404 资源</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        width: 380px;
+        max-height: 560px;
+        padding: 12px;
+        color: #111827;
+        font-size: 12px;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+        color: #111827;
+      }
+      .form-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .form-row label {
+        flex: 0 0 88px;
+        color: #4b5563;
+        font-size: 11px;
+      }
+      .form-row input {
+        flex: 1;
+        min-width: 0;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 11px;
+      }
+      .form-row input:focus {
+        outline: none;
+        border-color: #10b981;
+      }
+      .form-row input::placeholder {
+        color: #9ca3af;
+      }
+      .section {
+        margin-top: 12px;
+        border-top: 1px solid #e5e7eb;
+        padding-top: 10px;
+      }
+      .section-title {
+        font-size: 12px;
+        font-weight: 600;
+        color: #374151;
+        margin: 0 0 6px;
+      }
+      .hint {
+        font-size: 10px;
+        color: #6b7280;
+        margin-top: 4px;
+      }
+      button {
+        border: 0;
+        border-radius: 6px;
+        padding: 8px 12px;
+        font-size: 12px;
+        cursor: pointer;
+        background: #10b981;
+        color: #fff;
+      }
+      button:hover { background: #059669; }
+      button:disabled {
+        background: #9ca3af;
+        cursor: not-allowed;
+      }
+      button.secondary {
+        background: #e5e7eb;
+        color: #374151;
+      }
+      button.secondary:hover { background: #d1d5db; }
+      .btn-row {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      .list-box {
+        max-height: 180px;
+        overflow-y: auto;
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        padding: 6px;
+        background: #f9fafb;
+        font-size: 11px;
+      }
+      .list-item {
+        padding: 4px 6px;
+        border-bottom: 1px solid #f3f4f6;
+        word-break: break-all;
+      }
+      .list-item:last-child { border-bottom: 0; }
+      .list-item .path { color: #059669; }
+      .list-item .url { color: #6b7280; font-size: 10px; }
+      .empty-list { color: #9ca3af; padding: 8px; }
+      .failed-list .list-item .url { color: #dc2626; }
+      .failed-list .list-item .error { color: #b91c1c; font-size: 10px; }
+      .status-msg {
+        margin-top: 8px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-size: 11px;
+      }
+      .status-msg.info { background: #dbeafe; color: #1e40af; }
+      .status-msg.error { background: #fee2e2; color: #b91c1c; }
+      .status-msg.ok { background: #d1fae5; color: #065f46; }
+    </style>
+  </head>
+  <body>
+    <h1>补全 404 资源</h1>
+    <div class="form-row">
+      <label>游戏域名</label>
+      <input type="text" id="domain" placeholder="https://jelly-crush.apps.minigame.vip" />
+    </div>
+    <div class="form-row">
+      <label>下载目录</label>
+      <input type="text" id="downloadDir" placeholder="download-mini-games" />
+    </div>
+    <div class="form-row">
+      <label>游戏名（可选）</label>
+      <input type="text" id="gameName" placeholder="从当前页 URL 解析" />
+    </div>
+    <p class="hint">当前页地址会用于解析游戏名（如 /jelly-crush/ → jelly-crush），未填「游戏名」时使用。</p>
+    <div class="btn-row">
+      <button type="button" id="saveSettings">保存设置</button>
+      <button type="button" class="secondary" id="refresh404">刷新 404 列表</button>
+    </div>
+
+    <div class="section">
+      <div class="section-title">404 资源（同源请求）</div>
+      <div id="list404" class="list-box">
+        <div class="empty-list">暂无 404 记录，请在游戏页刷新或操作以触发请求。</div>
+      </div>
+      <div class="btn-row" style="margin-top: 8px;">
+        <button type="button" id="downloadAll">一键补全下载</button>
+      </div>
+    </div>
+
+    <div class="section" id="failedSection" style="display: none;">
+      <div class="section-title">下载失败的资源</div>
+      <div id="failedList" class="list-box failed-list"></div>
+    </div>
+
+    <div id="status" class="status-msg" style="display: none;"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

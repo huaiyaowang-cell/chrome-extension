@@ -1,5 +1,8 @@
 const OUTPUT_PREFIX = "downloaded-games";
 
+/** 下载选项：重名直接覆盖，不弹「另存为」对话框 */
+const DOWNLOAD_OPTS = { conflictAction: "overwrite", saveAs: false };
+
 const TRACKER_KEYWORDS = [
   "google-analytics", "googletagmanager", "doubleclick",
   "googlesyndication", "adservice.", "sentry.io",
@@ -24,7 +27,12 @@ const sessionReady = restoreSession();
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "START_MONITOR") {
     sessionReady
-      .then(() => startMonitor(message.tabId))
+      .then(() =>
+        startMonitor(message.tabId, {
+          manualGameUrl: message.manualGameUrl || null,
+          manualResourceUrls: message.manualResourceUrls || []
+        })
+      )
       .then((r) => sendResponse({ ok: true, ...r }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -37,9 +45,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "GET_MONITOR_STATUS") {
-    sessionReady.then(() => {
-      sendResponse({ ok: true, ...getMonitorStatus(message.tabId) });
+    sessionReady.then(async () => {
+      const status = getMonitorStatus(message.tabId);
+      if (status.status === "idle") {
+        const stored = await chrome.storage.local.get("lastGameInfo");
+        if (stored.lastGameInfo) Object.assign(status, stored.lastGameInfo);
+      }
+      sendResponse({ ok: true, ...status });
     });
+    return true;
+  }
+  if (message?.type === "EXPORT_CONFIG") {
+    sessionReady
+      .then(() => exportConfig(message.config, message.folder))
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  if (message?.type === "DOWNLOAD_MANUAL_RESOURCES") {
+    sessionReady
+      .then(() => downloadManualResources(message.tabId, message.urls))
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === "CAPTURE_HTML") {
@@ -83,11 +110,22 @@ chrome.webRequest.onCompleted.addListener(
         return;
       }
 
+      const reqHost = safeHost(url);
+      if (!isSameGameHost(reqHost, activeSession.gameHost)) return;
       void processRequest(url, details.type);
     });
   },
   { urls: ["http://*/*", "https://*/*"] }
 );
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!activeSession || activeSession.tabId !== tabId) return;
+  if (changeInfo.status === "loading") {
+    debuggerAttached = false;
+    pendingNetworkCaptures.clear();
+    void attachDebugger(tabId);
+  }
+});
 
 /* ── Tab removal ───────────────────────────────────────────── */
 
@@ -108,10 +146,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   if (method === "Network.responseReceived") {
     const { response, requestId, type } = params;
-    if (type !== "Document") return;
     const url = response.url || "";
-    if (url && url.startsWith("http")) {
-      pendingNetworkCaptures.set(requestId, { url });
+    if (!url || !url.startsWith("http")) return;
+    const reqHost = safeHost(url);
+    const fromGameHost = activeSession.gameHost && isSameGameHost(reqHost, activeSession.gameHost);
+    if (type === "Document") {
+      pendingNetworkCaptures.set(requestId, { url, type: "Document" });
+      return;
+    }
+    if (fromGameHost && ["Script", "XHR", "Fetch", "Stylesheet", "Image", "Media", "Font", "Other"].includes(type)) {
+      pendingNetworkCaptures.set(requestId, { url, type });
     }
   }
 
@@ -186,21 +230,148 @@ async function captureResponseBody(tabId, requestId, info) {
       );
     });
 
-    const body = result.base64Encoded ? decodeBase64Body(result.body) : result.body;
-    if (!body || body.length < 50) return;
+    const type = info.type || "Document";
+    const isDocument = type === "Document";
+    let bodyDecoded = null;
 
-    if (networkHtmlCache.size > 100) {
-      const oldest = networkHtmlCache.keys().next().value;
-      networkHtmlCache.delete(oldest);
+    if (isDocument) {
+      bodyDecoded = result.base64Encoded ? decodeBase64Body(result.body) : result.body;
+      if (!bodyDecoded || bodyDecoded.length < 50) return;
+      if (networkHtmlCache.size > 100) {
+        const oldest = networkHtmlCache.keys().next().value;
+        networkHtmlCache.delete(oldest);
+      }
+      networkHtmlCache.set(info.url, bodyDecoded);
+      const baseUrl = info.url.split("?")[0];
+      if (baseUrl !== info.url) networkHtmlCache.set(baseUrl, bodyDecoded);
+      console.log(`[poki-dl] HTML cached: ${info.url.slice(0, 100)} (${bodyDecoded.length} bytes, total=${networkHtmlCache.size})`);
     }
 
-    networkHtmlCache.set(info.url, body);
-    const baseUrl = info.url.split("?")[0];
-    if (baseUrl !== info.url) networkHtmlCache.set(baseUrl, body);
-    console.log(`[poki-dl] HTML cached: ${info.url.slice(0, 100)} (${body.length} bytes, total=${networkHtmlCache.size})`);
+    if (!activeSession || activeSession.tabId !== tabId) return;
+    const fromGameHost = activeSession.gameHost && isSameGameHost(safeHost(info.url), activeSession.gameHost);
+    if (!fromGameHost) return;
+
+    let localPath = urlToLocalPath(info.url);
+    const extFromUrl = extractExtFromUrl(info.url);
+    const extFromType = extensionForCdpType(type);
+    if (!extFromUrl && extFromType && !localPath.endsWith(extFromType)) {
+      localPath = localPath.endsWith("/") ? localPath.slice(0, -1) + extFromType : localPath + extFromType;
+    }
+    if (activeSession.downloadedLocalPaths.has(localPath)) {
+      activeSession.seenUrls.add(info.url);
+      return;
+    }
+    const filename = `${activeSession.folder}/${localPath}`;
+    const bodyEmpty = result.base64Encoded
+      ? !result.body || result.body.length < 100
+      : !result.body && !(isDocument && bodyDecoded);
+    if (bodyEmpty) {
+      try {
+        await downloadUrl(info.url, filename);
+        activeSession.downloadedLocalPaths.add(localPath);
+        activeSession.seenUrls.add(info.url);
+        activeSession.stats.downloaded += 1;
+        activeSession.files.push({
+          type: "asset",
+          sourceUrl: info.url,
+          localPath,
+          status: "ok",
+          requestType: type
+        });
+        console.log(`[poki-dl] CDP body 为空，直链下载: ${info.url.slice(0, 80)} -> ${localPath}`);
+        schedulePersist();
+        scheduleManifest();
+        updateBadgeCount();
+      } catch (e2) {
+        console.warn("[poki-dl] 直链下载失败:", info.url.slice(0, 60), e2.message);
+      }
+      return;
+    }
+    const ext = extFromUrl || extFromType || "";
+    const mime = mimeForCdpSave(type, ext, result.base64Encoded);
+    let dataUrl;
+    if (result.base64Encoded) {
+      dataUrl = `data:${mime};base64,${result.body}`;
+    } else {
+      const text = isDocument ? bodyDecoded : result.body;
+      dataUrl = `data:${mime};base64,${stringToBase64(text)}`;
+    }
+    if (type === "Font" && activeSession && localPath) {
+      activeSession.fontDataUrls[localPath] = dataUrl;
+    }
+    await new Promise((resolve, reject) => {
+      chrome.downloads.download(
+        { url: dataUrl, filename, ...DOWNLOAD_OPTS },
+        (id) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(id);
+        }
+      );
+    });
+    activeSession.downloadedLocalPaths.add(localPath);
+    activeSession.seenUrls.add(info.url);
+    activeSession.stats.downloaded += 1;
+    activeSession.files.push({
+      type: "asset",
+      sourceUrl: info.url,
+      localPath,
+      status: "ok",
+      requestType: type
+    });
+    console.log(`[poki-dl] CDP 保存: ${info.url.slice(0, 100)} -> ${localPath}`);
+    schedulePersist();
+    scheduleManifest();
+    updateBadgeCount();
   } catch (e) {
-    console.warn("[poki-dl] getResponseBody failed:", e.message);
+    console.warn("[poki-dl] getResponseBody/save failed:", e.message);
+    // 当 getResponseBody 失败（如二进制/大文件/缓存）时，用直链下载回退
+    if (!activeSession || activeSession.tabId !== tabId) return;
+    const fromGameHost = activeSession.gameHost && isSameGameHost(safeHost(info.url), activeSession.gameHost);
+    if (!fromGameHost) return;
+    if (activeSession.seenUrls.has(info.url)) return;
+    const type = info.type || "Other";
+    let localPath = urlToLocalPath(info.url);
+    const extFromUrl = extractExtFromUrl(info.url);
+    const extFromType = extensionForCdpType(type);
+    if (!extFromUrl && extFromType && !localPath.endsWith(extFromType)) {
+      localPath = localPath.endsWith("/") ? localPath.slice(0, -1) + extFromType : localPath + extFromType;
+    }
+    if (activeSession.downloadedLocalPaths.has(localPath)) {
+      activeSession.seenUrls.add(info.url);
+      return;
+    }
+    const filename = `${activeSession.folder}/${localPath}`;
+    try {
+      await downloadUrl(info.url, filename);
+      activeSession.downloadedLocalPaths.add(localPath);
+      activeSession.seenUrls.add(info.url);
+      activeSession.stats.downloaded += 1;
+      activeSession.files.push({
+        type: "asset",
+        sourceUrl: info.url,
+        localPath,
+        status: "ok",
+        requestType: type
+      });
+      console.log(`[poki-dl] CDP 失败后直链下载: ${info.url.slice(0, 80)} -> ${localPath}`);
+      schedulePersist();
+      scheduleManifest();
+      updateBadgeCount();
+    } catch (e2) {
+      console.warn("[poki-dl] 直链回退也失败:", info.url.slice(0, 60), e2.message);
+    }
   }
+}
+
+function stringToBase64(s) {
+  const bytes = new TextEncoder().encode(s);
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+    binary += String.fromCharCode.apply(null, slice);
+  }
+  return btoa(binary);
 }
 
 function decodeBase64Body(base64) {
@@ -291,18 +462,32 @@ async function flushRequestBuffer() {
 
 /* ── Request processing ────────────────────────────────────── */
 
+function isSameGameHost(requestHost, gameHost) {
+  if (!requestHost || !gameHost) return false;
+  if (requestHost === gameHost) return true;
+  // 同站不同子域也接受（例如资源来自 *.gdn.poki.com 的其他子域）
+  if (gameHost.endsWith(".gdn.poki.com") && requestHost.endsWith(".gdn.poki.com")) return true;
+  return false;
+}
+
 async function processRequest(url, requestType) {
   if (!activeSession?.gameHost) return;
   const host = safeHost(url);
-  if (host !== activeSession.gameHost) return;
+  if (!isSameGameHost(host, activeSession.gameHost)) return;
   if (activeSession.seenUrls.has(url)) return;
   activeSession.seenUrls.add(url);
+
+  const localPath = urlToLocalPath(url);
+  if (activeSession.downloadedLocalPaths.has(localPath)) {
+    return;
+  }
   if (activeSession.pending.has(url)) return;
   activeSession.pending.add(url);
 
-  const localPath = urlToLocalPath(url);
+  console.log("[poki-dl] 下载:", url.slice(0, 120));
   try {
     await downloadUrl(url, `${activeSession.folder}/${localPath}`);
+    activeSession.downloadedLocalPaths.add(localPath);
     activeSession.stats.downloaded += 1;
     activeSession.files.push({
       type: "asset",
@@ -331,7 +516,9 @@ async function processRequest(url, requestType) {
 
 /* ── Monitor lifecycle ─────────────────────────────────────── */
 
-async function startMonitor(tabId) {
+async function startMonitor(tabId, options = {}) {
+  const { manualGameUrl, manualResourceUrls = [] } = options;
+
   const pageInfo = await getPageInfoFromTab(tabId);
   if (!pageInfo?.pageUrl) throw new Error("无法读取页面信息。");
 
@@ -360,21 +547,51 @@ async function startMonitor(tabId) {
     gameBaseUrl: null,
     seenUrls: new Set(),
     pending: new Set(),
+    /** 当前监听会话中已下载的本地路径，用于去重，避免同一文件重复下载 */
+    downloadedLocalPaths: new Set(),
     stats: { totalSeen: 0, downloaded: 0, failed: 0, skipped: 0 },
     files: [],
-    htmlCaptured: false
+    htmlCaptured: false,
+    /** 字体 data URL，用于生成 index 时内联，避免 file:// 下无法加载 */
+    fontDataUrls: {}
   };
 
   requestBuffer = [];
   networkHtmlCache.clear();
 
   const dbgOk = await attachDebugger(tabId);
-  startGameframeDetection(tabId);
+
+  if (manualGameUrl && manualGameUrl.startsWith("http")) {
+    try {
+      const url = new URL(manualGameUrl);
+      activeSession.gameHost = url.host;
+      activeSession.gameUrl = manualGameUrl;
+      activeSession.gameBaseUrl = getBaseUrl(manualGameUrl);
+      console.log(`[poki-dl] 使用手动游戏地址: ${url.host}, base: ${activeSession.gameBaseUrl}`);
+      await flushRequestBuffer();
+    } catch (e) {
+      console.warn("[poki-dl] 手动游戏地址解析失败:", e.message);
+    }
+  }
+
+  if (!activeSession.gameHost) startGameframeDetection(tabId);
+
+  if (manualResourceUrls.length > 0) {
+    void downloadManualResources(tabId, manualResourceUrls);
+  }
 
   await persistSession();
   await chrome.storage.local.set({ lastGameInfo: { gameName, folder } });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
   await chrome.action.setBadgeText({ tabId, text: "ON" });
+
+  // 使用手动游戏地址时，资源请求往往已在之前完成，只有刷新页面才会再次发起请求。
+  // 延迟刷新，确保 session 已写入 storage（否则 SW 被终止后恢复时可能读不到 gameHost）
+  if (manualGameUrl && manualGameUrl.startsWith("http") && activeSession.gameHost) {
+    setTimeout(() => {
+      chrome.tabs.reload(tabId).catch((e) => console.warn("[poki-dl] 自动刷新失败:", e?.message));
+    }, 500);
+  }
 
   return { gameName, folder, status: "listening", debugger: dbgOk };
 }
@@ -453,6 +670,18 @@ function getMonitorStatus(tabId) {
 
 /* ── HTML & script generation ──────────────────────────────── */
 
+/** 将 @font-face 中的字体 url 替换为内联 data URL，避免 file:// 下无法加载 */
+function inlineFontDataUrls(html) {
+  const fontDataUrls = activeSession?.fontDataUrls;
+  if (!fontDataUrls || Object.keys(fontDataUrls).length === 0) return html;
+  return html.replace(/url\s*\(\s*["']?([^"')]+)["']?\s*\)/gi, (match, path) => {
+    const normalized = path.replace(/^\.\//, "").split("?")[0].trim();
+    const dataUrl = fontDataUrls[normalized];
+    if (dataUrl) return 'url("' + dataUrl.replace(/"/g, "%22") + '")';
+    return match;
+  });
+}
+
 async function generateIndexHtml(rawHtml, gameUrl) {
   const gameBaseUrl = getBaseUrl(gameUrl);
   const urlMap = buildUrlToLocalMap();
@@ -462,6 +691,11 @@ async function generateIndexHtml(rawHtml, gameUrl) {
   html = rewriteRemainingAbsoluteUrls(html, gameBaseUrl);
   html = neutralizePokiSdk(html);
   html = removeDynamicLoaderContent(html, detectGameEngine());
+  html = inlineFontDataUrls(html);
+  html = html.replace(
+    /<meta\s+name="apple-mobile-web-app-capable"\s+content="[^"]*"\s*\/?>/gi,
+    '<meta name="mobile-web-app-capable" content="yes">'
+  );
 
   const scriptTags = '<script src="poki-sdk-stub.js"></script>';
   const headMatch = html.match(/<head[^>]*>/i);
@@ -601,9 +835,14 @@ function buildSdkStubContent() {
   Document.prototype.getElementById = function(id) {
     var el = _origGBI.call(this, id);
     if (!el) {
-      el = document.createElement("div");
+      var sid = (id || "").toLowerCase();
+      var isCanvasLike = sid.indexOf("canvas") >= 0 || sid === "gl" || sid === "webgl"
+        || sid === "renderer" || sid === "three" || sid === "gl-canvas"
+        || sid === "webgl-canvas";
+      el = document.createElement(isCanvasLike ? "canvas" : "div");
       el.id = id;
-      el.style.display = "none";
+      if (!isCanvasLike) el.style.display = "none";
+      if (isCanvasLike) { el.width = 800; el.height = 600; el.style.display = "block"; }
       el.dataset.pokiPlaceholder = "1";
       if (document.body) document.body.appendChild(el);
     }
@@ -919,9 +1158,11 @@ function urlToLocalPath(urlString) {
     } catch {}
   }
 
-  if (pathname === url.pathname && activeSession?.gameHost === url.host) {
+  if (pathname === url.pathname) {
     const segs = pathname.split("/").filter(Boolean);
-    if (segs.length >= 2) {
+    const sameGameHost = activeSession?.gameHost && isSameGameHost(url.host, activeSession.gameHost);
+    const fromGdnPoki = url.host.endsWith(".gdn.poki.com");
+    if (segs.length >= 2 && (sameGameHost || fromGdnPoki)) {
       pathname = "/" + segs.slice(1).join("/");
     }
   }
@@ -930,12 +1171,7 @@ function urlToLocalPath(urlString) {
     .split("/")
     .filter(Boolean)
     .map((s) => sanitizeName(s));
-  let filePath = segments.join("/") || "index";
-  if (url.search) {
-    const h = simpleHash(url.search).slice(0, 8);
-    filePath = appendSuffix(filePath, `__q${h}`);
-  }
-  return filePath;
+  return segments.join("/") || "index";
 }
 
 function getBaseUrl(url) {
@@ -1036,6 +1272,86 @@ async function downloadExtraAsset(tabId, url, assetKey) {
   return { localPath, filename };
 }
 
+/** 手动指定的静态资源 URL 列表，下载到游戏目录 */
+async function downloadManualResources(tabId, urls) {
+  const list = Array.isArray(urls) ? urls.filter((u) => u && String(u).startsWith("http")) : [];
+  if (list.length === 0) return { ok: true, downloaded: 0 };
+
+  let folder, gameName;
+  if (activeSession && activeSession.tabId === tabId) {
+    folder = activeSession.folder;
+    gameName = activeSession.gameName;
+  } else {
+    const stored = await chrome.storage.local.get("lastGameInfo");
+    const info = stored.lastGameInfo;
+    if (!info?.folder) throw new Error("无游戏目录，请先开始监听。");
+    folder = info.folder;
+    gameName = info.gameName || "poki-game";
+  }
+
+  let downloaded = 0;
+  for (let i = 0; i < list.length; i++) {
+    const url = list[i];
+    const localPath = urlToLocalPath(url);
+    if (activeSession && activeSession.downloadedLocalPaths.has(localPath)) {
+      activeSession.seenUrls.add(url);
+      continue;
+    }
+    try {
+      await downloadUrl(url, `${folder}/${localPath}`);
+      downloaded += 1;
+      if (activeSession) {
+        activeSession.downloadedLocalPaths.add(localPath);
+        activeSession.seenUrls.add(url);
+        activeSession.stats.downloaded += 1;
+        upsertFile({ type: "asset", sourceUrl: url, localPath, status: "ok", requestType: "manual" });
+        schedulePersist();
+        scheduleManifest();
+        updateBadgeCount();
+      }
+    } catch (err) {
+      console.warn(`[poki-dl] manual resource failed: ${url}`, err.message);
+      if (activeSession) {
+        activeSession.stats.failed += 1;
+        upsertFile({
+          type: "asset",
+          sourceUrl: url,
+          localPath,
+          status: "failed",
+          requestType: "manual",
+          error: String(err?.message || err)
+        });
+      }
+    }
+  }
+  console.log(`[poki-dl] manual resources: ${downloaded}/${list.length} downloaded`);
+  return { ok: true, downloaded, total: list.length };
+}
+
+/** 导出配置为 JSON 并下载到游戏目录（相对于浏览器默认下载目录） */
+async function exportConfig(config, folder) {
+  if (!folder) {
+    const stored = await chrome.storage.local.get("lastGameInfo");
+    folder = stored.lastGameInfo?.folder;
+  }
+  if (!folder) throw new Error("无游戏目录，请先开始监听。");
+
+  const json = JSON.stringify(
+    {
+      gameName: config.gameName,
+      folder: config.folder,
+      manualGameUrl: config.manualGameUrl || null,
+      manualResourceUrls: config.manualResourceUrls || []
+    },
+    null,
+    2
+  );
+
+  const filename = `${folder}/poki-download-config.json`;
+  await downloadText(filename, json, "application/json");
+  return { ok: true, filename };
+}
+
 function extractExtFromUrl(url) {
   try {
     const pathname = new URL(url).pathname;
@@ -1046,12 +1362,67 @@ function extractExtFromUrl(url) {
   return "";
 }
 
+/** 按 CDP 资源类型返回扩展名（URL 无扩展名时用） */
+function extensionForCdpType(cdpType) {
+  switch (cdpType) {
+    case "Script": return ".js";
+    case "Stylesheet": return ".css";
+    case "Document": return ".html";
+    case "Image": return ".png";
+    case "Media": return ".mp4";
+    case "Font": return ".woff2";
+    default: return "";
+  }
+}
+
+/** 按 CDP 类型和扩展名返回 data URL 的 MIME，避免被 Chrome 存成 .txt */
+function mimeForCdpSave(cdpType, ext, isBinary) {
+  if (isBinary) return "application/octet-stream";
+  switch (cdpType) {
+    case "Script": return "application/javascript";
+    case "Stylesheet": return "text/css";
+    case "Document":
+      if (ext === ".json") return "application/json";
+      if (ext === ".html" || ext === "") return "text/html";
+      return "application/octet-stream";
+    case "Image":
+      if (ext === ".png") return "image/png";
+      if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+      if (ext === ".gif") return "image/gif";
+      if (ext === ".webp") return "image/webp";
+      if (ext === ".svg") return "image/svg+xml";
+      return "image/png";
+    case "Font":
+      if (ext === ".woff2") return "font/woff2";
+      if (ext === ".woff") return "font/woff";
+      if (ext === ".ttf") return "font/ttf";
+      return "font/woff2";
+    case "Media":
+      if (ext === ".mp4") return "video/mp4";
+      if (ext === ".webm") return "video/webm";
+      if (ext === ".mp3") return "audio/mpeg";
+      return "application/octet-stream";
+    default:
+      if (ext === ".json") return "application/json";
+      if (ext === ".js") return "application/javascript";
+      if (ext === ".css") return "text/css";
+      if (ext === ".html") return "text/html";
+      if (ext === ".zip") return "application/zip";
+      if (ext === ".wasm") return "application/wasm";
+      if (ext === ".png") return "image/png";
+      if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+      if (ext === ".gif") return "image/gif";
+      if (ext === ".webp") return "image/webp";
+      return "application/octet-stream";
+  }
+}
+
 /* ── Download helpers ──────────────────────────────────────── */
 
 async function downloadUrl(url, filename) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
-      { url, filename, conflictAction: "overwrite", saveAs: false },
+      { url, filename, ...DOWNLOAD_OPTS },
       (downloadId) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
@@ -1072,7 +1443,7 @@ async function downloadText(filename, textContent, mimeType) {
   const dataUrl = `data:${mimeType};base64,${btoa(binary)}`;
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
-      { url: dataUrl, filename, conflictAction: "overwrite", saveAs: false },
+      { url: dataUrl, filename, ...DOWNLOAD_OPTS },
       (downloadId) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
@@ -1155,7 +1526,8 @@ async function persistSession() {
     stats: activeSession.stats,
     seenUrlsList: Array.from(activeSession.seenUrls),
     files: activeSession.files,
-    htmlCaptured: activeSession.htmlCaptured
+    htmlCaptured: activeSession.htmlCaptured,
+    fontDataUrls: activeSession.fontDataUrls || {}
   };
   await chrome.storage.local.set({ activeSession: serializable });
 }
@@ -1166,10 +1538,16 @@ async function restoreSession() {
     const saved = stored.activeSession;
     if (!saved || saved.status !== "listening") return;
 
+    const files = saved.files || [];
+    const downloadedPaths = new Set(
+      files.filter((f) => f.status === "ok" && f.localPath).map((f) => f.localPath)
+    );
     activeSession = {
       ...saved,
       seenUrls: new Set(saved.seenUrlsList || []),
-      pending: new Set()
+      pending: new Set(),
+      downloadedLocalPaths: downloadedPaths,
+      fontDataUrls: saved.fontDataUrls || {}
     };
     delete activeSession.seenUrlsList;
 

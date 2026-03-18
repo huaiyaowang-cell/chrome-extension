@@ -2,6 +2,15 @@ const startBtn = document.getElementById("startBtn");
 const captureBtn = document.getElementById("captureBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
+const manualGameUrlEl = document.getElementById("manualGameUrl");
+const manualResourceListEl = document.getElementById("manualResourceList");
+const addResourceBtn = document.getElementById("addResourceBtn");
+const exportConfigBtn = document.getElementById("exportConfigBtn");
+const importConfigBtn = document.getElementById("importConfigBtn");
+const importFileEl = document.getElementById("importFile");
+const clearConfigBtn = document.getElementById("clearConfigBtn");
+
+const POPUP_CONFIG_KEY = "popupConfig";
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -84,6 +93,76 @@ async function refreshStatus() {
   }
 }
 
+function getManualResourceUrls() {
+  const inputs = manualResourceListEl.querySelectorAll(".resource-row input");
+  return Array.from(inputs)
+    .map((el) => el.value.trim())
+    .filter(Boolean);
+}
+
+function savePopupConfig() {
+  const manualGameUrl = manualGameUrlEl.value.trim() || null;
+  const manualResourceUrls = getManualResourceUrls();
+  chrome.storage.local.set({
+    [POPUP_CONFIG_KEY]: { manualGameUrl, manualResourceUrls }
+  });
+}
+
+async function loadPopupConfig() {
+  const stored = await chrome.storage.local.get(POPUP_CONFIG_KEY);
+  const config = stored[POPUP_CONFIG_KEY];
+  if (config) {
+    manualGameUrlEl.value = config.manualGameUrl || "";
+    manualResourceListEl.innerHTML = "";
+    const urls = Array.isArray(config.manualResourceUrls) ? config.manualResourceUrls : [];
+    if (urls.length === 0) addResourceRow();
+    else urls.forEach((u) => addResourceRow(typeof u === "string" ? u : ""));
+  } else {
+    if (manualResourceListEl.children.length === 0) addResourceRow();
+  }
+}
+
+function addResourceRow(value = "") {
+  const row = document.createElement("div");
+  row.className = "resource-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "https://...";
+  input.value = value;
+  const removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.className = "secondary remove-btn";
+  removeBtn.textContent = "删除";
+  removeBtn.addEventListener("click", () => {
+    row.remove();
+    savePopupConfig();
+  });
+  row.appendChild(input);
+  row.appendChild(removeBtn);
+  manualResourceListEl.appendChild(row);
+}
+
+addResourceBtn.addEventListener("click", () => {
+  addResourceRow();
+  savePopupConfig();
+});
+
+manualGameUrlEl.addEventListener("blur", () => savePopupConfig());
+manualResourceListEl.addEventListener("blur", (e) => {
+  if (e.target.matches("input")) savePopupConfig();
+}, true);
+
+/* 初始化：从 storage 恢复配置，若无则至少一行 */
+void loadPopupConfig();
+
+clearConfigBtn.addEventListener("click", () => {
+  manualGameUrlEl.value = "";
+  manualResourceListEl.innerHTML = "";
+  addResourceRow();
+  savePopupConfig();
+  setStatus("配置已清空。");
+});
+
 startBtn.addEventListener("click", async () => {
   updateButtons("disabled");
   setStatus("正在开启监听...");
@@ -92,18 +171,33 @@ startBtn.addEventListener("click", async () => {
     const tab = await getActiveTab();
     if (!tab?.id) throw new Error("未找到当前标签页。");
 
+    const manualGameUrl = manualGameUrlEl.value.trim() || null;
+    const manualResourceUrls = getManualResourceUrls();
+
     const result = await chrome.runtime.sendMessage({
       type: "START_MONITOR",
-      tabId: tab.id
+      tabId: tab.id,
+      manualGameUrl,
+      manualResourceUrls
     });
 
     if (!result) throw new Error("后台无响应，请在 chrome://extensions/ 重新加载插件。");
     if (!result.ok) throw new Error(result.error || "开启监听失败。");
 
-    setStatus(
-      `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/\n\n请现在刷新页面，进入游戏。\n检测到游戏后资源将自动下载。`
-    );
+    const usedManualUrl = !!manualGameUrl && manualGameUrl.startsWith("http");
+    let statusMsg = usedManualUrl
+      ? `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/\n\n已使用游戏地址，页面将自动刷新，资源会通过 CDP 抓取并保存。`
+      : `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/\n\n请现在刷新页面，进入游戏。\n检测到游戏后资源将自动下载。\n\n若刷新后仍无下载：可填写上方「游戏地址」和「指定下载的静态资源」后重新开始监听。`;
+    if (usedManualUrl) {
+      try {
+        const port = chrome.runtime.connect({ name: "keepalive" });
+        window._keepAlivePort = port;
+        statusMsg += "\n\n请勿关闭本弹窗，直至控制台出现多行「CDP 保存」后再关闭。";
+      } catch (_) {}
+    }
+    setStatus(statusMsg);
     updateButtons("listening");
+    savePopupConfig();
   } catch (error) {
     setError(`错误: ${error.message}`);
     updateButtons("idle");
@@ -198,6 +292,60 @@ for (const { btn, input, key } of assetButtons) {
     }
   });
 }
+
+/* ── 配置导出 / 导入 ── */
+
+exportConfigBtn.addEventListener("click", async () => {
+  try {
+    const tab = await getActiveTab();
+    if (!tab?.id) throw new Error("未找到当前标签页。");
+    const statusResult = await chrome.runtime.sendMessage({
+      type: "GET_MONITOR_STATUS",
+      tabId: tab.id
+    });
+    if (!statusResult?.ok) throw new Error("无法获取状态。");
+    const folder = statusResult.folder;
+    const gameName = statusResult.gameName || "poki-game";
+    if (!folder) throw new Error("无游戏目录信息，请先开始监听一次。");
+
+    const config = {
+      gameName,
+      folder,
+      manualGameUrl: manualGameUrlEl.value.trim() || null,
+      manualResourceUrls: getManualResourceUrls()
+    };
+
+    const result = await chrome.runtime.sendMessage({
+      type: "EXPORT_CONFIG",
+      config,
+      folder
+    });
+    if (!result?.ok) throw new Error(result?.error || "导出失败。");
+    setStatus(`配置已导出到：${result.filename}`);
+  } catch (e) {
+    setError(`导出失败: ${e.message}`);
+  }
+});
+
+importConfigBtn.addEventListener("click", () => importFileEl.click());
+
+importFileEl.addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  e.target.value = "";
+  try {
+    const text = await file.text();
+    const config = JSON.parse(text);
+    if (config.manualGameUrl != null) manualGameUrlEl.value = config.manualGameUrl || "";
+    const urls = Array.isArray(config.manualResourceUrls) ? config.manualResourceUrls : [];
+    manualResourceListEl.innerHTML = "";
+    if (urls.length === 0) addResourceRow();
+    else urls.forEach((u) => addResourceRow(typeof u === "string" ? u : ""));
+    setStatus(`已导入配置，游戏: ${config.gameName || "-"}，${urls.length} 个资源地址。`);
+  } catch (err) {
+    setError(`导入失败: ${err.message}`);
+  }
+});
 
 /* ── Polling ── */
 
