@@ -10,11 +10,12 @@ const failedSection = document.getElementById("failedSection");
 const failedListEl = document.getElementById("failedList");
 const statusEl = document.getElementById("status");
 const saveSettingsBtn = document.getElementById("saveSettings");
-const refresh404Btn = document.getElementById("refresh404");
-const downloadAllBtn = document.getElementById("downloadAll");
+const toggleListenBtn = document.getElementById("toggleListen");
+const clear404Btn = document.getElementById("clear404");
 
 let currentTabId = null;
 let current404List = [];
+let isListening = false;
 
 function showStatus(text, type) {
   statusEl.textContent = text;
@@ -86,8 +87,33 @@ async function load404List() {
       if (suggested) gameNameEl.placeholder = "当前页解析: " + suggested;
     }
     render404List(current404List);
+    renderFailedList(res.failed || []);
   } catch (e) {
     list404El.innerHTML = '<div class="empty-list">请求失败: ' + (e.message || e) + "</div>";
+  }
+}
+
+async function loadListenStatus() {
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "GET_LISTEN_STATUS"
+    });
+    if (res?.ok) {
+      isListening = res.listeningTabId === tab.id;
+      updateListenButton();
+    }
+  } catch {}
+}
+
+function updateListenButton() {
+  if (isListening) {
+    toggleListenBtn.textContent = "停止监听";
+    toggleListenBtn.classList.add("secondary");
+  } else {
+    toggleListenBtn.textContent = "开始监听";
+    toggleListenBtn.classList.remove("secondary");
   }
 }
 
@@ -155,65 +181,90 @@ saveSettingsBtn.addEventListener("click", async () => {
   }
 });
 
-refresh404Btn.addEventListener("click", () => {
-  load404List();
-  showStatus("已刷新 404 列表。", "info");
-  setTimeout(hideStatus, 1500);
-});
-
-downloadAllBtn.addEventListener("click", async () => {
-  const domain = domainEl.value.trim();
-  const downloadDir = downloadDirEl.value.trim();
-  const gameName = gameNameEl.value.trim();
-  if (!domain || !downloadDir) {
-    showStatus("请先填写「游戏域名」和「下载目录」并保存。", "error");
+toggleListenBtn.addEventListener("click", async () => {
+  const tab = await getActiveTab();
+  if (!tab?.id) {
+    showStatus("未获取到当前标签页。请先在游戏页激活该标签，再点击扩展图标打开。", "error");
     return;
   }
-  if (!current404List.length) {
-    showStatus("当前没有 404 资源可下载，请先刷新列表或刷新游戏页。", "error");
+  const tabUrl = (tab.url || "").trim();
+  if (!tabUrl.startsWith("http://") && !tabUrl.startsWith("https://")) {
+    showStatus("当前页不是网页。请先打开游戏页（如 http://localhost:8083/jelly-crush/）再点「开始监听」。", "error");
     return;
   }
-
-  downloadAllBtn.disabled = true;
-  showStatus("正在下载 " + current404List.length + " 个资源…", "info");
-
-  try {
-    const res = await chrome.runtime.sendMessage({
-      type: "DOWNLOAD_404",
-      tabId: currentTabId,
-      items: current404List.map((e) => ({ url: e.url, relativePath: e.relativePath })),
-      domain,
-      downloadDir,
-      gameName
-    });
-
-    if (!res?.ok) {
-      showStatus(res?.error || "下载请求失败", "error");
-      downloadAllBtn.disabled = false;
+  if (isListening) {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "STOP_LISTEN" });
+      if (res?.ok) {
+        isListening = false;
+        updateListenButton();
+        showStatus("已停止监听。", "ok");
+        setTimeout(hideStatus, 1500);
+      } else {
+        showStatus(res?.error || "停止失败", "error");
+      }
+    } catch (e) {
+      showStatus("停止失败: " + (e?.message || e), "error");
+    }
+  } else {
+    const domain = domainEl.value.trim();
+    const downloadDir = downloadDirEl.value.trim();
+    if (!domain || !downloadDir) {
+      showStatus("请先填写并保存「游戏域名」和「下载目录」，监听期间将自动下载 404 资源。", "error");
       return;
     }
-
-    const downloaded = res.downloaded || [];
-    const failed = res.failed || [];
-    if (failed.length) {
-      renderFailedList(failed);
+    toggleListenBtn.disabled = true;
+    try {
+      const res = await chrome.runtime.sendMessage({
+        type: "START_LISTEN",
+        tabId: tab.id
+      });
+      if (res?.ok) {
+        isListening = true;
+        updateListenButton();
+        showStatus("已开始监听当前标签页，检测到 404 将自动下载补全。", "ok");
+        setTimeout(hideStatus, 2500);
+      } else {
+        showStatus(res?.error || "开始监听失败", "error");
+      }
+    } catch (e) {
+      const msg = e?.message || String(e);
       showStatus(
-        "已下载 " + downloaded.length + " 个，失败 " + failed.length + " 个。失败列表见下方。",
+        msg.indexOf("Receiving end") !== -1 || msg.indexOf("establish connection") !== -1
+          ? "后台未就绪，请关闭弹窗后重新点击扩展图标再试。"
+          : "开始失败: " + msg,
         "error"
       );
-    } else {
+    }
+    toggleListenBtn.disabled = false;
+  }
+});
+
+clear404Btn.addEventListener("click", async () => {
+  if (!currentTabId) return;
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "CLEAR_404_LIST",
+      tabId: currentTabId
+    });
+    if (res?.ok) {
+      current404List = [];
+      render404List([]);
       renderFailedList([]);
-      showStatus("已成功下载 " + downloaded.length + " 个资源到 " + downloadDir + "/&lt;游戏名&gt;/…", "ok");
+      showStatus("已清空 404 列表。", "ok");
+      setTimeout(hideStatus, 1500);
+    } else {
+      showStatus(res?.error || "清空失败", "error");
     }
   } catch (e) {
-    showStatus("下载失败: " + (e.message || e), "error");
+    showStatus("清空失败: " + (e.message || e), "error");
   }
-  downloadAllBtn.disabled = false;
 });
 
 // 初始化
 (async () => {
   await loadSettings();
   await suggestGameName();
+  await loadListenStatus();
   await load404List();
 })();

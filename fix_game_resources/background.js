@@ -5,12 +5,28 @@
 
 const STORAGE_404 = "fixGameResources_404";
 const STORAGE_SETTINGS = "fixGameResources_settings";
+const STORAGE_LISTENING = "fixGameResources_listeningTabId";
 
-/* ── 404 收集：webRequest ───────────────────────────────────── */
+/* ── 监听状态 ───────────────────────────────────────────────── */
+
+async function getListeningTabId() {
+  const raw = await chrome.storage.local.get(STORAGE_LISTENING);
+  const id = raw[STORAGE_LISTENING];
+  return id != null && Number.isInteger(id) ? id : null;
+}
+
+async function setListeningTabId(tabId) {
+  await chrome.storage.local.set({ [STORAGE_LISTENING]: tabId });
+}
+
+/* ── 404 收集 + 自动下载：仅在“开始监听”时 ────────────────────── */
 
 chrome.webRequest.onCompleted.addListener(
   async (details) => {
     if (details.statusCode !== 404 || details.tabId < 0) return;
+    const listeningTabId = await getListeningTabId();
+    if (listeningTabId === null || details.tabId !== listeningTabId) return;
+
     const url = details.url;
     if (!url || !url.startsWith("http")) return;
 
@@ -21,7 +37,6 @@ chrome.webRequest.onCompleted.addListener(
 
       const pageUrlObj = new URL(pageUrl);
       const reqUrlObj = new URL(url);
-      // 仅处理与当前页同源的 404（同 host）
       if (pageUrlObj.host !== reqUrlObj.host) return;
 
       const basePath = getBasePath(pageUrlObj.pathname);
@@ -32,12 +47,16 @@ chrome.webRequest.onCompleted.addListener(
         relativePath = relativePath.replace(/^\//, "");
       }
 
-      await append404(details.tabId, pageUrl, {
+      const entry = {
         url,
         relativePath,
         statusCode: details.statusCode,
         time: new Date().toISOString()
-      });
+      };
+      await append404(details.tabId, pageUrl, entry);
+
+      // 监听到 404 后自动下载补全
+      await autoDownloadOne(details.tabId, pageUrl, entry);
     } catch (e) {
       console.warn("[fix_game_resources] onCompleted:", e.message);
     }
@@ -59,8 +78,10 @@ async function get404Storage() {
 
 async function append404(tabId, pageUrl, entry) {
   const data = await get404Storage();
-  const tabData = data[tabId] || { pageUrl, list: [] };
+  const tabData = data[tabId] || { pageUrl, list: [], failed: [] };
   tabData.pageUrl = pageUrl;
+  if (!tabData.list) tabData.list = [];
+  if (!tabData.failed) tabData.failed = [];
   const exists = tabData.list.some((e) => e.url === entry.url);
   if (!exists) {
     tabData.list.push(entry);
@@ -69,9 +90,57 @@ async function append404(tabId, pageUrl, entry) {
   await chrome.storage.local.set({ [STORAGE_404]: data });
 }
 
+async function appendFailed(tabId, item) {
+  const data = await get404Storage();
+  const tabData = data[tabId] || { pageUrl: "", list: [], failed: [] };
+  if (!tabData.failed) tabData.failed = [];
+  tabData.failed.push(item);
+  data[tabId] = tabData;
+  await chrome.storage.local.set({ [STORAGE_404]: data });
+}
+
+/** 监听到 404 时自动下载单个资源 */
+async function autoDownloadOne(tabId, pageUrl, entry) {
+  const settings = await getSettings();
+  const domain = (settings.domain || "").trim();
+  const downloadDir = (settings.downloadDir || "").trim();
+  if (!domain || !downloadDir) return;
+
+  let gameName = (settings.gameName || "").trim();
+  if (!gameName) gameName = parseGameNameFromUrl(pageUrl);
+  if (!gameName) return;
+
+  const rel = (entry.relativePath || "").replace(/^\//, "");
+  if (!rel) return;
+
+  const baseDomain = domain.replace(/\/+$/, "");
+  const sourceUrl = `${baseDomain}/${rel}`;
+  const filename = `${downloadDir}/${gameName}/${rel}`;
+
+  try {
+    await new Promise((resolve, reject) => {
+      chrome.downloads.download(
+        { url: sourceUrl, filename, conflictAction: "overwrite", saveAs: false },
+        (downloadId) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(downloadId);
+        }
+      );
+    });
+  } catch (e) {
+    await appendFailed(tabId, {
+      url: sourceUrl,
+      relativePath: rel,
+      error: e && e.message ? e.message : String(e)
+    });
+  }
+}
+
 /* ── Tab 关闭时清理 ─────────────────────────────────────────── */
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const listening = await getListeningTabId();
+  if (listening === tabId) await setListeningTabId(null);
   const data = await get404Storage();
   if (data[tabId]) {
     delete data[tabId];
@@ -110,10 +179,72 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({
           ok: true,
           pageUrl: tabData?.pageUrl || "",
-          list: tabData?.list || []
+          list: tabData?.list || [],
+          failed: tabData?.failed || []
         });
       })
       .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+
+  if (message?.type === "START_LISTEN") {
+    (async () => {
+      try {
+        const tabId = message.tabId;
+        if (tabId == null || !Number.isInteger(tabId) || tabId < 1) {
+          sendResponse({ ok: false, error: "无效的标签页，请确保在游戏页再点扩展图标打开" });
+          return;
+        }
+        await setListeningTabId(tabId);
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) || String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.type === "STOP_LISTEN") {
+    (async () => {
+      try {
+        await setListeningTabId(null);
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) || String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.type === "GET_LISTEN_STATUS") {
+    (async () => {
+      try {
+        const id = await getListeningTabId();
+        sendResponse({ ok: true, listeningTabId: id });
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) || String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.type === "CLEAR_404_LIST") {
+    const tabId = message.tabId;
+    if (tabId == null) {
+      sendResponse({ ok: false, error: "missing tabId" });
+      return true;
+    }
+    (async () => {
+      try {
+        const data = await get404Storage();
+        const tabData = data[tabId];
+        data[tabId] = { pageUrl: (tabData && tabData.pageUrl) || "", list: [], failed: [] };
+        await chrome.storage.local.set({ [STORAGE_404]: data });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) || String(e) });
+      }
+    })();
     return true;
   }
 

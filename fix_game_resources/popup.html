@@ -131,19 +131,19 @@
       <label>游戏名（可选）</label>
       <input type="text" id="gameName" placeholder="从当前页 URL 解析" />
     </div>
-    <p class="hint">当前页地址会用于解析游戏名（如 /jelly-crush/ → jelly-crush），未填「游戏名」时使用。</p>
+    <p class="hint">当前页地址会用于解析游戏名（如 /jelly-crush/ → jelly-crush），未填「游戏名」时使用。开始监听后，检测到 404 会自动下载补全。</p>
     <div class="btn-row">
       <button type="button" id="saveSettings">保存设置</button>
-      <button type="button" class="secondary" id="refresh404">刷新 404 列表</button>
+      <button type="button" id="toggleListen">开始监听</button>
     </div>
 
     <div class="section">
       <div class="section-title">404 资源（同源请求）</div>
       <div id="list404" class="list-box">
-        <div class="empty-list">暂无 404 记录，请在游戏页刷新或操作以触发请求。</div>
+        <div class="empty-list">点击「开始监听」后，在游戏页刷新或操作，监听到的 404 会列在下方并自动下载补全。</div>
       </div>
       <div class="btn-row" style="margin-top: 8px;">
-        <button type="button" id="downloadAll">一键补全下载</button>
+        <button type="button" class="secondary" id="clear404">清空 404 列表</button>
       </div>
     </div>
 
