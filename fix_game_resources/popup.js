@@ -27,6 +27,37 @@ function hideStatus() {
   statusEl.style.display = "none";
 }
 
+/**
+ * 将完整游戏地址规范化为根地址（用于下载拼接）
+ * 例如 …/254297e9-e0ef-4650-9c0d-8b5459d5c927/index.html → …/254297e9-e0ef-4650-9c0d-8b5459d5c927
+ */
+function normalizeGameDomainUrl(input) {
+  if (!input || typeof input !== "string") return "";
+  const raw = input.trim();
+  if (!raw.startsWith("http://") && !raw.startsWith("https://")) return raw;
+  try {
+    const u = new URL(raw);
+    let path = u.pathname
+      .replace(/\/index\.html$/i, "")
+      .replace(/\/+$/, "") || "";
+    if (path && !path.startsWith("/")) path = "/" + path;
+    return u.origin + path;
+  } catch {
+    return raw;
+  }
+}
+
+/** 当前页是否为 Poki 游戏地址（用于自动填充） */
+function isPokiGameUrl(url) {
+  if (!url || !url.startsWith("http")) return false;
+  try {
+    const host = new URL(url).host.toLowerCase();
+    return host.includes("poki.com") || host.includes("gdn.poki.com");
+  } catch {
+    return false;
+  }
+}
+
 function parseGameNameFromUrl(url) {
   if (!url || !url.startsWith("http")) return "";
   try {
@@ -47,7 +78,7 @@ async function loadSettings() {
   try {
     const res = await chrome.runtime.sendMessage({ type: "GET_SETTINGS" });
     if (res?.ok && res.settings) {
-      domainEl.value = res.settings.domain || "";
+      domainEl.value = normalizeGameDomainUrl(res.settings.domain || "") || res.settings.domain || "";
       downloadDirEl.value = res.settings.downloadDir || "";
       gameNameEl.value = res.settings.gameName || "";
     }
@@ -56,12 +87,17 @@ async function loadSettings() {
   }
 }
 
-async function suggestGameName() {
+async function suggestFromTab() {
   const tab = await getActiveTab();
-  if (!tab?.id) return;
-  const name = parseGameNameFromUrl(tab.url);
+  if (!tab?.id || !tab.url) return;
+  const url = tab.url.trim();
+  const name = parseGameNameFromUrl(url);
   if (name && !gameNameEl.value.trim()) {
     gameNameEl.placeholder = "当前页解析: " + name;
+  }
+  if (isPokiGameUrl(url) && !domainEl.value.trim()) {
+    domainEl.value = normalizeGameDomainUrl(url);
+    if (name) gameNameEl.placeholder = "当前页解析: " + name;
   }
 }
 
@@ -160,7 +196,8 @@ function escapeHtml(s) {
 }
 
 saveSettingsBtn.addEventListener("click", async () => {
-  const domain = domainEl.value.trim();
+  const rawDomain = domainEl.value.trim();
+  const domain = normalizeGameDomainUrl(rawDomain) || rawDomain;
   const downloadDir = downloadDirEl.value.trim();
   const gameName = gameNameEl.value.trim();
   try {
@@ -264,7 +301,7 @@ clear404Btn.addEventListener("click", async () => {
 // 初始化
 (async () => {
   await loadSettings();
-  await suggestGameName();
+  await suggestFromTab();
   await loadListenStatus();
   await load404List();
 })();

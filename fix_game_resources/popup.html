@@ -120,8 +120,8 @@
   <body>
     <h1>补全 404 资源</h1>
     <div class="form-row">
-      <label>游戏域名</label>
-      <input type="text" id="domain" placeholder="https://jelly-crush.apps.minigame.vip" />
+      <label>游戏地址/域名</label>
+      <input type="text" id="domain" placeholder="minigame 或 Poki 完整地址均可" />
     </div>
     <div class="form-row">
       <label>下载目录</label>
@@ -131,7 +131,7 @@
       <label>游戏名（可选）</label>
       <input type="text" id="gameName" placeholder="从当前页 URL 解析" />
     </div>
-    <p class="hint">当前页地址会用于解析游戏名（如 /jelly-crush/ → jelly-crush），未填「游戏名」时使用。开始监听后，检测到 404 会自动下载补全。</p>
+    <p class="hint">支持 minigame 域名或 Poki 完整地址（如 …gdn.poki.com/xxx-xxx/index.html，会自动转为根地址）。游戏名可从当前页解析；开始监听后 404 将自动下载补全。</p>
     <div class="btn-row">
       <button type="button" id="saveSettings">保存设置</button>
       <button type="button" id="toggleListen">开始监听</button>

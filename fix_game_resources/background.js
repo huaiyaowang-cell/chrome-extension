@@ -19,6 +19,29 @@ async function setListeningTabId(tabId) {
   await chrome.storage.local.set({ [STORAGE_LISTENING]: tabId });
 }
 
+/**
+ * 从请求 URL 取「编码后的相对路径」（保留 %20 等），保证保存的文件名与请求一致，避免仍 404。
+ */
+function getEncodedRelativePath(pageUrl, requestUrl) {
+  try {
+    const pageUrlObj = new URL(pageUrl);
+    const reqUrlObj = new URL(requestUrl);
+    if (pageUrlObj.host !== reqUrlObj.host) return null;
+    const basePath = getBasePath(pageUrlObj.pathname);
+    const fullPathEncoded = requestUrl.slice(reqUrlObj.origin.length).split("?")[0].split("#")[0];
+    const pathEncoded = fullPathEncoded.startsWith("/") ? fullPathEncoded : "/" + fullPathEncoded;
+    let relativePath = pathEncoded;
+    if (basePath && pathEncoded.startsWith(basePath)) {
+      relativePath = pathEncoded.slice(basePath.length).replace(/^\//, "") || pathEncoded.slice(1);
+    } else {
+      relativePath = pathEncoded.replace(/^\//, "");
+    }
+    return relativePath || null;
+  } catch {
+    return null;
+  }
+}
+
 /* ── 404 收集 + 自动下载：仅在“开始监听”时 ────────────────────── */
 
 chrome.webRequest.onCompleted.addListener(
@@ -35,17 +58,8 @@ chrome.webRequest.onCompleted.addListener(
       const pageUrl = tab.url || "";
       if (!pageUrl || !pageUrl.startsWith("http")) return;
 
-      const pageUrlObj = new URL(pageUrl);
-      const reqUrlObj = new URL(url);
-      if (pageUrlObj.host !== reqUrlObj.host) return;
-
-      const basePath = getBasePath(pageUrlObj.pathname);
-      let relativePath = reqUrlObj.pathname;
-      if (basePath && relativePath.startsWith(basePath)) {
-        relativePath = relativePath.slice(basePath.length).replace(/^\//, "") || relativePath.slice(1);
-      } else {
-        relativePath = relativePath.replace(/^\//, "");
-      }
+      const relativePath = getEncodedRelativePath(pageUrl, url);
+      if (!relativePath) return;
 
       const entry = {
         url,
@@ -54,8 +68,6 @@ chrome.webRequest.onCompleted.addListener(
         time: new Date().toISOString()
       };
       await append404(details.tabId, pageUrl, entry);
-
-      // 监听到 404 后自动下载补全
       await autoDownloadOne(details.tabId, pageUrl, entry);
     } catch (e) {
       console.warn("[fix_game_resources] onCompleted:", e.message);
@@ -113,9 +125,15 @@ async function autoDownloadOne(tabId, pageUrl, entry) {
   const rel = (entry.relativePath || "").replace(/^\//, "");
   if (!rel) return;
 
-  const baseDomain = domain.replace(/\/+$/, "");
+  const baseDomain = normalizeGameDomainUrl(domain).replace(/\/+$/, "");
   const sourceUrl = `${baseDomain}/${rel}`;
-  const filename = `${downloadDir}/${gameName}/${rel}`;
+  let relForFile = rel;
+  try {
+    relForFile = decodeURIComponent(rel);
+  } catch {
+    /* 非合法编码则用原路径 */
+  }
+  const filename = `${downloadDir}/${gameName}/${relForFile}`;
 
   try {
     await new Promise((resolve, reject) => {
@@ -165,6 +183,21 @@ function parseGameNameFromUrl(pageUrl) {
     return segments[0] || "";
   } catch {
     return "";
+  }
+}
+
+/** 将完整游戏地址（含 /index.html）规范化为根地址，支持 minigame / Poki */
+function normalizeGameDomainUrl(input) {
+  if (!input || typeof input !== "string") return "";
+  const raw = String(input).trim();
+  if (!raw.startsWith("http://") && !raw.startsWith("https://")) return raw;
+  try {
+    const u = new URL(raw);
+    let path = u.pathname.replace(/\/index\.html$/i, "").replace(/\/+$/, "") || "";
+    if (path && !path.startsWith("/")) path = "/" + path;
+    return u.origin + path;
+  } catch {
+    return raw;
   }
 }
 
@@ -262,10 +295,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === "SAVE_SETTINGS") {
     const { domain = "", downloadDir = "", gameName = "" } = message;
+    const normalizedDomain = normalizeGameDomainUrl(String(domain).trim()) || String(domain).trim();
     chrome.storage.local
       .set({
         [STORAGE_SETTINGS]: {
-          domain: String(domain).trim(),
+          domain: normalizedDomain,
           downloadDir: String(downloadDir).trim(),
           gameName: String(gameName).trim()
         }
