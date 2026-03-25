@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>游戏通用下载器</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        width: 420px;
+        max-width: 96vw;
+        padding: 14px;
+        color: #111827;
+      }
+
+      h1 {
+        font-size: 15px;
+        margin: 0 0 8px;
+      }
+
+      .desc {
+        margin: 0 0 12px;
+        font-size: 11px;
+        color: #6b7280;
+        line-height: 1.45;
+      }
+
+      label {
+        display: block;
+        font-size: 11px;
+        color: #374151;
+        margin: 8px 0 4px;
+      }
+
+      select,
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 7px 9px;
+        font-size: 12px;
+        outline: none;
+      }
+
+      select:focus,
+      input:focus {
+        border-color: #7c3aed;
+      }
+
+      .row-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      button {
+        flex: 1;
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 10px;
+        background: #7c3aed;
+        color: #fff;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        background: #c4b5fd;
+        cursor: not-allowed;
+      }
+
+      .secondary {
+        background: #e5e7eb;
+        color: #111827;
+      }
+
+      .secondary:disabled {
+        background: #e5e7eb;
+        color: #9ca3af;
+      }
+
+      .full {
+        width: 100%;
+        margin-top: 8px;
+      }
+
+      .status {
+        margin-top: 10px;
+        min-height: 36px;
+        font-size: 11px;
+        color: #1f2937;
+        white-space: pre-wrap;
+        line-height: 1.4;
+      }
+
+      .status.error {
+        color: #dc2626;
+      }
+
+      .listen-row,
+      .resource-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+
+      .listen-row input,
+      .resource-row input {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .listen-row button,
+      .resource-row button {
+        width: auto;
+        flex-shrink: 0;
+        padding: 6px 10px;
+        font-size: 11px;
+        background: #fecaca;
+        color: #b91c1c;
+      }
+
+      .add-btn {
+        width: 100%;
+        margin-top: 4px;
+        font-size: 12px;
+        background: #f3f4f6;
+        color: #374151;
+      }
+
+      .section {
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid #e5e7eb;
+      }
+
+      .section h2 {
+        font-size: 12px;
+        margin: 0 0 6px;
+        color: #4b5563;
+      }
+
+      .hint {
+        margin-top: 8px;
+        font-size: 10px;
+        color: #9ca3af;
+      }
+
+      .asset-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+
+      .asset-row label {
+        margin: 0;
+        min-width: 64px;
+        white-space: nowrap;
+      }
+
+      .asset-row input {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .asset-row button {
+        width: auto;
+        padding: 5px 10px;
+        font-size: 11px;
+      }
+
+      #importFile {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>游戏通用下载器</h1>
+    <p class="desc">
+      填写游戏入口 URL 与目录后「开始监听」，在当前标签页刷新并游玩以抓取资源。停止时会写入
+      assets-manifest.json，并尽量生成本地 index.html + 桩脚本 + 拦截器。
+    </p>
+
+    <label for="platform">平台类型</label>
+    <select id="platform">
+      <option value="crazygames">crazygames</option>
+      <option value="poki">poki</option>
+      <option value="minigame">minigame</option>
+    </select>
+
+    <label for="gameUrl">游戏 URL（入口 HTML，必填）</label>
+    <input type="text" id="gameUrl" placeholder="https://…/index.html" />
+
+    <label>监听 URL 前缀（可选，不填则使用游戏 URL 去掉 .html 后的路径）</label>
+    <div id="listenList"></div>
+    <button type="button" id="addListenBtn" class="secondary add-btn">➕ 添加监听 URL</button>
+
+    <label for="downloadDir">下载目录（相对浏览器下载文件夹，必填）</label>
+    <input type="text" id="downloadDir" placeholder="downloaded-games" />
+
+    <label for="gameName">游戏名称（必填，子目录名）</label>
+    <input type="text" id="gameName" placeholder="my-game" />
+
+    <div class="section">
+      <h2>指定静态资源 URL（可选）</h2>
+      <div id="manualResourceList"></div>
+      <button type="button" id="addResourceBtn" class="secondary add-btn">➕ 添加资源 URL</button>
+    </div>
+
+    <div class="row-actions">
+      <button type="button" id="saveConfigBtn" class="secondary">保存配置</button>
+    </div>
+
+    <button type="button" id="startBtn" class="full">开始监听</button>
+    <button type="button" id="captureBtn" class="secondary full" disabled>生成 HTML</button>
+    <button type="button" id="stopBtn" class="secondary full" disabled>停止监听并写入清单</button>
+
+    <div id="status" class="status"></div>
+
+    <div class="section">
+      <h2>附加资源下载</h2>
+      <div class="asset-row">
+        <label>图标</label>
+        <input type="text" id="gameIconUrl" placeholder="game_icon URL" />
+        <button type="button" class="secondary" id="dlGameIcon">下载</button>
+      </div>
+      <div class="asset-row">
+        <label>预览视频</label>
+        <input type="text" id="thumbnailVideoUrl" placeholder="thumbnail_video URL" />
+        <button type="button" class="secondary" id="dlThumbnailVideo">下载</button>
+      </div>
+      <div class="asset-row">
+        <label>封面</label>
+        <input type="text" id="gameCoverUrl" placeholder="game_cover URL" />
+        <button type="button" class="secondary" id="dlGameCover">下载</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>配置导入 / 导出</h2>
+      <div class="row-actions">
+        <button type="button" id="exportConfigBtn" class="secondary">导出到游戏目录</button>
+        <button type="button" id="importConfigBtn" class="secondary">导入 JSON</button>
+      </div>
+      <input type="file" id="importFile" accept=".json,application/json" />
+    </div>
+
+    <p class="hint">保存路径：&lt;下载目录&gt;/&lt;游戏名称&gt;/</p>
+    <script src="popup.js"></script>
+  </body>
+</html>
