@@ -1,10 +1,14 @@
 const CONFIG_KEY = "downloadGameExtensionConfig";
 
+const DEFAULT_DOWNLOAD_DIR_PRESETS = ["downloaded-games", "poki-games"];
+
 const platformEl = document.getElementById("platform");
 const gameUrlEl = document.getElementById("gameUrl");
 const listenListEl = document.getElementById("listenList");
 const addListenBtn = document.getElementById("addListenBtn");
 const downloadDirEl = document.getElementById("downloadDir");
+const downloadDirPresetsEl = document.getElementById("downloadDirPresets");
+const addDownloadDirPresetBtn = document.getElementById("addDownloadDirPresetBtn");
 const gameNameEl = document.getElementById("gameName");
 const manualResourceListEl = document.getElementById("manualResourceList");
 const addResourceBtn = document.getElementById("addResourceBtn");
@@ -46,6 +50,68 @@ function getListenUrls() {
     .filter(Boolean);
 }
 
+/** 与 background 中 downloadDir 规范化一致 */
+function normalizeDownloadDir(s) {
+  return String(s || "")
+    .trim()
+    .replace(/^\/+|\/+$/g, "");
+}
+
+let downloadDirPresets = [...DEFAULT_DOWNLOAD_DIR_PRESETS];
+
+function dedupePresetsOrder(list) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of list) {
+    const n = normalizeDownloadDir(raw);
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function renderDownloadDirPresets() {
+  if (!downloadDirPresetsEl) return;
+  downloadDirPresetsEl.innerHTML = "";
+  const list = dedupePresetsOrder(downloadDirPresets);
+  downloadDirPresets = list;
+  for (const dir of list) {
+    const chip = document.createElement("div");
+    chip.className = "preset-chip";
+    chip.setAttribute("role", "button");
+    chip.tabIndex = 0;
+    chip.title = "点击填入输入框";
+    const label = document.createElement("span");
+    label.textContent = dir;
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "preset-rm";
+    rm.textContent = "×";
+    rm.title = "删除此备选项";
+    rm.addEventListener("click", (e) => {
+      e.stopPropagation();
+      downloadDirPresets = downloadDirPresets.filter((x) => normalizeDownloadDir(x) !== dir);
+      void saveConfigToStorage();
+      renderDownloadDirPresets();
+    });
+    chip.addEventListener("click", () => {
+      downloadDirEl.value = dir;
+      void saveConfigToStorage();
+    });
+    chip.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        downloadDirEl.value = dir;
+        void saveConfigToStorage();
+      }
+    });
+    chip.appendChild(label);
+    chip.appendChild(rm);
+    downloadDirPresetsEl.appendChild(chip);
+  }
+}
+
 function getManualResourceUrls() {
   const inputs = manualResourceListEl.querySelectorAll(".resource-row input");
   return Array.from(inputs)
@@ -59,6 +125,7 @@ function getFormConfig() {
     gameUrl: gameUrlEl.value.trim(),
     listenUrls: getListenUrls(),
     downloadDir: downloadDirEl.value.trim(),
+    downloadDirPresets: dedupePresetsOrder(downloadDirPresets),
     gameName: gameNameEl.value.trim(),
     manualResourceUrls: getManualResourceUrls()
   };
@@ -81,6 +148,8 @@ async function saveConfigToStorage() {
 async function loadConfigFromStorage() {
   const { [CONFIG_KEY]: stored } = await chrome.storage.local.get(CONFIG_KEY);
   if (!stored) {
+    downloadDirPresets = [...DEFAULT_DOWNLOAD_DIR_PRESETS];
+    renderDownloadDirPresets();
     if (listenListEl.children.length === 0) addListenRow("");
     if (manualResourceListEl.children.length === 0) addResourceRow("");
     return;
@@ -89,6 +158,15 @@ async function loadConfigFromStorage() {
   gameUrlEl.value = stored.gameUrl || "";
   downloadDirEl.value = stored.downloadDir || "downloaded-games";
   gameNameEl.value = stored.gameName || "";
+
+  if (stored.downloadDirPresets === undefined) {
+    downloadDirPresets = [...DEFAULT_DOWNLOAD_DIR_PRESETS];
+  } else if (Array.isArray(stored.downloadDirPresets)) {
+    downloadDirPresets = dedupePresetsOrder(stored.downloadDirPresets);
+  } else {
+    downloadDirPresets = [...DEFAULT_DOWNLOAD_DIR_PRESETS];
+  }
+  renderDownloadDirPresets();
 
   listenListEl.innerHTML = "";
   const listens = Array.isArray(stored.listenUrls) ? stored.listenUrls : [];
@@ -147,6 +225,23 @@ addListenBtn.addEventListener("click", () => {
 addResourceBtn.addEventListener("click", () => {
   addResourceRow("");
   void saveConfigToStorage();
+});
+
+addDownloadDirPresetBtn.addEventListener("click", () => {
+  const v = normalizeDownloadDir(downloadDirEl.value);
+  if (!v) {
+    setError("请先在输入框中填写有效的目录名。");
+    return;
+  }
+  const next = dedupePresetsOrder([...downloadDirPresets, v]);
+  if (next.length === downloadDirPresets.length) {
+    setStatus("该目录已在备选项中。");
+    return;
+  }
+  downloadDirPresets = next;
+  void saveConfigToStorage();
+  renderDownloadDirPresets();
+  setStatus("已加入备选项并保存。");
 });
 
 gameUrlEl.addEventListener("blur", () => {
@@ -220,6 +315,9 @@ async function refreshStatus() {
       return;
     }
     const s = result.stats || {};
+    const entryCacheStatus = result.entryHtmlCached
+      ? "已缓存 ✓（可点生成 HTML）"
+      : "未缓存 ✗（等待游戏加载…）";
     setStatus(
       [
         "状态: 监听中",
@@ -228,10 +326,12 @@ async function refreshStatus() {
         `域名: ${result.gameHost || "-"}`,
         `监听前缀数: ${result.listenCount ?? "-"}`,
         `已下载: ${s.downloaded || 0} 失败: ${s.failed || 0}`,
-        `HTML 缓存条目: ${result.networkCacheSize ?? 0}（含入口页）`,
-        `入口 HTML: ${result.htmlCaptured ? "已生成" : "未生成"}`,
+        `Debugger: ${result.debuggerAttached ? "已连接" : "未连接"} | HTML缓存条数: ${result.networkCacheSize ?? 0}`,
+        `入口 HTML 网络缓存: ${entryCacheStatus}`,
+        result.actualGameUrl ? `实际入口URL: ${result.actualGameUrl.slice(0, 60)}…` : "",
+        `入口 HTML 文件: ${result.htmlCaptured ? "已生成 ✓" : "未生成"}`,
         `目录: ${result.folder}/`
-      ].join("\n")
+      ].filter(Boolean).join("\n")
     );
     updateButtons("listening");
   } catch {
@@ -386,6 +486,10 @@ importFileEl.addEventListener("change", async (e) => {
     if (j.gameUrl != null) gameUrlEl.value = j.gameUrl;
     if (j.downloadDir != null) downloadDirEl.value = j.downloadDir;
     if (j.gameName != null) gameNameEl.value = j.gameName;
+    if (Array.isArray(j.downloadDirPresets)) {
+      downloadDirPresets = dedupePresetsOrder(j.downloadDirPresets);
+      renderDownloadDirPresets();
+    }
     listenListEl.innerHTML = "";
     const lu = Array.isArray(j.listenUrls) ? j.listenUrls : [];
     if (lu.length === 0) addListenRow("");

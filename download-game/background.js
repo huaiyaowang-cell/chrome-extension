@@ -1,7 +1,8 @@
 import {
   getPokiSdkStub,
   getMinigameSdkStub,
-  getCrazyGamesSdkStub
+  getCrazyGamesSdkStub,
+  getGamePushFailsafeScript
 } from "./stubs.js";
 
 const DOWNLOAD_OPTS = { conflictAction: "overwrite", saveAs: false };
@@ -91,9 +92,7 @@ chrome.webRequest.onCompleted.addListener(
       if (!url.startsWith("http")) return;
 
       if (details.type === "main_frame" || details.type === "sub_frame") {
-        if (shouldCaptureDocumentForCache(url)) {
-          void fetchAndCacheHtmlFromUrl(url);
-        }
+        console.log(`[game-dl] webRequest Document: ${url.slice(0, 120)} (${details.type}, frameId=${details.frameId})`);
         return;
       }
 
@@ -120,6 +119,19 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 });
 
+chrome.webNavigation.onCompleted.addListener((details) => {
+  if (!activeSession || details.tabId !== activeSession.tabId) return;
+  if (activeSession.status !== "listening") return;
+  const url = details.url;
+  if (!url || !url.startsWith("http")) return;
+  console.log(`[game-dl] webNavigation completed: ${url.slice(0, 120)} (frameId=${details.frameId})`);
+  if (isSameDocumentAsGame(activeSession.gameUrl, url) || urlMatchesListen(url)) {
+    captureHtmlViaFrameScript(details.tabId, details.frameId, url).catch((e) => {
+      console.warn("[game-dl] captureHtmlViaFrameScript failed:", e.message);
+    });
+  }
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (activeSession?.tabId === tabId) {
     void detachDebugger(tabId);
@@ -138,9 +150,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     if (!url || !url.startsWith("http")) return;
 
     if (type === "Document") {
-      if (shouldCaptureDocumentForCache(url)) {
-        pendingNetworkCaptures.set(requestId, { url, type: "Document" });
-      }
+      console.log(`[game-dl] CDP Document detected: ${url.slice(0, 120)} (reqId=${requestId})`);
+      pendingNetworkCaptures.set(requestId, { url, type: "Document" });
       return;
     }
     if (
@@ -246,41 +257,308 @@ function rememberHtmlCache(url, html) {
   const base = url.split("?")[0];
   networkHtmlCache.set(url, html);
   networkHtmlCache.set(base, html);
-  if (activeSession?.gameUrl) {
-    const gu = activeSession.gameUrl;
-    const gb = gu.split("?")[0];
-    if (isSameDocumentAsGame(gu, url)) {
-      networkHtmlCache.set(gu, html);
-      networkHtmlCache.set(gb, html);
+
+  if (!activeSession?.gameUrl) return;
+  const gu = activeSession.gameUrl;
+  const gb = gu.split("?")[0];
+
+  const isGameEntry =
+    isSameDocumentAsGame(gu, url) ||
+    url === gu ||
+    base === gb ||
+    (urlMatchesListen(url) && looksLikeHtmlDocument(html));
+
+  if (isGameEntry) {
+    networkHtmlCache.set(gu, html);
+    networkHtmlCache.set(gb, html);
+    if (activeSession && url !== gu) {
+      activeSession.actualGameUrl = url;
+      console.log(`[game-dl] 记录实际入口 URL: ${url.slice(0, 120)}`);
     }
+    persistGameEntryHtml(html);
   }
 }
 
-function resolveGameHtmlForGenerate() {
+function looksLikeHtmlDocument(text) {
+  if (!text) return false;
+  const head = text.slice(0, 1000).toLowerCase();
+  return head.includes("<!doctype") || head.includes("<html") || head.includes("<head");
+}
+
+function persistGameEntryHtml(html) {
+  if (!html) return;
+  chrome.storage.local.set({ gameEntryHtml: html }).catch(() => {});
+  console.log(`[game-dl] 入口 HTML 已持久化到 storage (${html.length} bytes)`);
+}
+
+async function loadPersistedGameEntryHtml() {
+  try {
+    const { gameEntryHtml } = await chrome.storage.local.get("gameEntryHtml");
+    if (gameEntryHtml && gameEntryHtml.length > 20) {
+      console.log(`[game-dl] 从 storage 恢复入口 HTML (${gameEntryHtml.length} bytes)`);
+      return gameEntryHtml;
+    }
+  } catch {}
+  return null;
+}
+
+async function resolveGameHtmlForGenerate() {
   const gameUrl = activeSession?.gameUrl;
   if (!gameUrl) return null;
+
   let h = findInNetworkCache(gameUrl);
-  if (h) return h;
+  if (h) { console.log("[game-dl] resolve: found in networkCache (direct)"); return h; }
+
   for (const [u, body] of networkHtmlCache) {
-    if (isSameDocumentAsGame(gameUrl, u)) return body;
+    if (isSameDocumentAsGame(gameUrl, u)) {
+      console.log("[game-dl] resolve: found via isSameDocumentAsGame:", u.slice(0, 80));
+      return body;
+    }
+  }
+
+  h = await loadPersistedGameEntryHtml();
+  if (h) { console.log("[game-dl] resolve: found in persisted storage"); return h; }
+
+  h = await tryGetHtmlViaCdpResourceTree();
+  if (h) { console.log("[game-dl] resolve: found via CDP Page.getResourceTree"); return h; }
+
+  h = await tryGetHtmlViaScripting();
+  if (h) { console.log("[game-dl] resolve: found via chrome.scripting"); return h; }
+
+  return null;
+}
+
+async function tryGetHtmlViaScripting() {
+  if (!activeSession) return null;
+  const tabId = activeSession.tabId;
+  const gameUrl = activeSession.gameUrl;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        return { url: location.href, href: location.href };
+      }
+    });
+
+    let targetFrameId = null;
+    for (const r of (results || [])) {
+      if (r.result?.url) {
+        const frameUrl = r.result.url;
+        const frameBase = frameUrl.split("?")[0];
+        const gameBase = gameUrl.split("?")[0];
+        if (frameBase === gameBase ||
+            frameUrl.includes(activeSession?.gameHost) ||
+            frameBase.endsWith("/index.html") && frameBase.includes(activeSession?.gameHost)) {
+          targetFrameId = r.frameId;
+          break;
+        }
+      }
+    }
+
+    if (targetFrameId == null) {
+      console.warn("[game-dl] tryGetHtmlViaScripting: no matching frame found");
+      return null;
+    }
+
+    console.log(`[game-dl] tryGetHtmlViaScripting: found game frame, frameId=${targetFrameId}`);
+    const htmlResults = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [targetFrameId] },
+      func: async () => {
+        try {
+          const resp = await fetch(location.href, { cache: "no-store" });
+          if (resp.ok) return await resp.text();
+        } catch {}
+        return null;
+      }
+    });
+
+    const html = htmlResults?.[0]?.result;
+    if (html && html.length > 50) {
+      console.log(`[game-dl] ✓ tryGetHtmlViaScripting: ${html.length} bytes`);
+      return html;
+    }
+  } catch (e) {
+    console.warn("[game-dl] tryGetHtmlViaScripting failed:", e.message);
   }
   return null;
 }
 
+async function tryGetHtmlViaCdpResourceTree() {
+  if (!activeSession || !debuggerAttached) return null;
+  const gu = activeSession.gameUrl;
+  const gb = gu?.split("?")[0] || "";
+  if (networkHtmlCache.has(gu) || networkHtmlCache.has(gb)) {
+    return networkHtmlCache.get(gu) || networkHtmlCache.get(gb);
+  }
+
+  const tabId = activeSession.tabId;
+  try {
+    const tree = await new Promise((resolve, reject) => {
+      chrome.debugger.sendCommand({ tabId }, "Page.getResourceTree", {}, (res) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(res);
+      });
+    });
+
+    const allFrames = [];
+    function collectFrames(ft) {
+      if (ft.frame) allFrames.push(ft.frame);
+      if (ft.childFrames) ft.childFrames.forEach(collectFrames);
+    }
+    collectFrames(tree.frameTree);
+
+    console.log(`[game-dl] Page.getResourceTree: ${allFrames.length} frames`);
+    allFrames.forEach(f => console.log(`[game-dl]   frame: ${f.url?.slice(0, 120)}`));
+
+    let targetFrame = allFrames.find(f => isSameDocumentAsGame(gu, f.url));
+    if (!targetFrame) {
+      targetFrame = allFrames.find(f => f.url && urlMatchesListen(f.url));
+    }
+    if (!targetFrame) {
+      targetFrame = allFrames.find(f => {
+        if (!f.url) return false;
+        return f.url.includes(activeSession.gameHost);
+      });
+    }
+
+    if (!targetFrame) {
+      console.warn("[game-dl] CDP ResourceTree: no matching frame");
+      return null;
+    }
+
+    console.log(`[game-dl] CDP ResourceTree target: ${targetFrame.url?.slice(0, 100)}, id=${targetFrame.id}`);
+
+    const content = await new Promise((resolve, reject) => {
+      chrome.debugger.sendCommand(
+        { tabId },
+        "Page.getResourceContent",
+        { frameId: targetFrame.id, url: targetFrame.url },
+        (res) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(res);
+        }
+      );
+    });
+
+    let html = content.base64Encoded ? decodeBase64Body(content.content) : content.content;
+    if (html && html.length > 50) {
+      console.log(`[game-dl] ✓ CDP ResourceContent: ${html.length} bytes`);
+      networkHtmlCache.set(gu, html);
+      networkHtmlCache.set(gb, html);
+      networkHtmlCache.set(targetFrame.url, html);
+      const frameBase = targetFrame.url.split("?")[0];
+      if (frameBase !== targetFrame.url) networkHtmlCache.set(frameBase, html);
+      if (targetFrame.url !== gu) activeSession.actualGameUrl = targetFrame.url;
+      rememberHtmlCache(targetFrame.url, html);
+      return html;
+    }
+    console.warn("[game-dl] CDP ResourceContent: empty or too short");
+  } catch (e) {
+    console.warn("[game-dl] CDP ResourceTree failed:", e.message);
+  }
+  return null;
+}
+
+async function captureHtmlViaFrameScript(tabId, frameId, url) {
+  if (!activeSession) return;
+  const gu = activeSession.gameUrl;
+  const gb = gu?.split("?")[0] || "";
+  if (networkHtmlCache.has(gu) || networkHtmlCache.has(gb)) {
+    console.log("[game-dl] captureHtmlViaFrameScript: already cached, skip");
+    return;
+  }
+
+  console.log(`[game-dl] captureHtmlViaFrameScript: injecting fetch into frameId=${frameId}, url=${url.slice(0, 100)}`);
+
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      func: async () => {
+        try {
+          const resp = await fetch(location.href, { cache: "no-store" });
+          if (resp.ok) return await resp.text();
+        } catch {}
+        return null;
+      }
+    });
+
+    const html = results?.[0]?.result;
+    if (html && html.length > 50) {
+      console.log(`[game-dl] ✓ captureHtmlViaFrameScript: got HTML ${html.length} bytes from frameId=${frameId}`);
+      networkHtmlCache.set(gu, html);
+      networkHtmlCache.set(gb, html);
+      networkHtmlCache.set(url, html);
+      const urlBase = url.split("?")[0];
+      if (urlBase !== url) networkHtmlCache.set(urlBase, html);
+      if (url !== gu) activeSession.actualGameUrl = url;
+      persistGameEntryHtml(html);
+    } else {
+      console.warn("[game-dl] captureHtmlViaFrameScript: no HTML returned from frame script");
+    }
+  } catch (e) {
+    console.warn("[game-dl] captureHtmlViaFrameScript error:", e.message);
+  }
+}
+
+async function tryCdpResourceCapture(url) {
+  if (!activeSession || !debuggerAttached) {
+    console.warn("[game-dl] tryCdpResourceCapture: no session or debugger");
+    return;
+  }
+  const gu = activeSession.gameUrl;
+  const gb = gu?.split("?")[0] || "";
+  if (networkHtmlCache.has(gu) || networkHtmlCache.has(gb)) return;
+
+  console.log(`[game-dl] tryCdpResourceCapture: waiting for frame to settle, then trying CDP...`);
+  await new Promise(r => setTimeout(r, 1000));
+
+  await tryGetHtmlViaCdpResourceTree();
+}
+
 async function fetchAndCacheHtmlFromUrl(url) {
   if (!activeSession) return;
+  const gu = activeSession.gameUrl;
+  const gb = gu?.split("?")[0] || "";
   const base = url.split("?")[0];
-  if (networkHtmlCache.has(url) || networkHtmlCache.has(base)) return;
-  try {
-    const resp = await fetch(url, { cache: "no-store", credentials: "omit" });
-    if (!resp.ok) return;
-    const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    if (!ct.includes("html") && !ct.includes("xml") && !/\.html?(\?|$)/i.test(url)) return;
-    const text = await resp.text();
-    rememberHtmlCache(url, text);
-    console.log("[game-dl] HTML cached (navigation fetch):", url.slice(0, 96));
-  } catch (e) {
-    console.warn("[game-dl] fetch HTML cache failed:", url.slice(0, 80), e.message);
+  if (networkHtmlCache.has(gu) || networkHtmlCache.has(gb)) return;
+  if (!isSameDocumentAsGame(gu, url) && networkHtmlCache.has(url)) return;
+
+  for (const cred of ["omit", "include"]) {
+    try {
+      const resp = await fetch(url, { cache: "no-store", credentials: cred });
+      if (!resp.ok) {
+        console.warn(`[game-dl] fetch HTML (cred=${cred}) status:`, resp.status, url.slice(0, 80));
+        continue;
+      }
+      const text = await resp.text();
+      if (text && text.length > 20 && looksLikeHtmlDocument(text)) {
+        rememberHtmlCache(url, text);
+        console.log("[game-dl] HTML cached (fetch):", url.slice(0, 96), `(${text.length} bytes)`);
+        return;
+      }
+      if (text && text.length > 20) {
+        rememberHtmlCache(url, text);
+        console.log("[game-dl] HTML cached (fetch, non-HTML?):", url.slice(0, 96), `(${text.length} bytes)`);
+        return;
+      }
+    } catch (e) {
+      console.warn(`[game-dl] fetch (cred=${cred}) failed:`, url.slice(0, 80), e.message);
+    }
+  }
+
+  const noQuery = url.split("?")[0];
+  if (noQuery !== url) {
+    try {
+      const resp = await fetch(noQuery, { cache: "no-store", credentials: "omit" });
+      if (resp.ok) {
+        const text = await resp.text();
+        if (text && text.length > 20) {
+          rememberHtmlCache(url, text);
+          console.log("[game-dl] HTML cached (fetch no-query):", noQuery.slice(0, 96), `(${text.length} bytes)`);
+          return;
+        }
+      }
+    } catch {}
   }
 }
 
@@ -303,21 +581,33 @@ async function attachDebugger(tabId) {
   return new Promise((resolve) => {
     chrome.debugger.attach({ tabId }, "1.3", () => {
       if (chrome.runtime.lastError) {
-        console.warn("[game-dl] debugger attach failed:", chrome.runtime.lastError.message);
-        resolve(false);
+        console.warn("[game-dl] debugger attach skipped (already attached?):", chrome.runtime.lastError.message);
+        enableNetwork(tabId, resolve);
         return;
       }
-      chrome.debugger.sendCommand({ tabId }, "Network.enable", {}, () => {
-        if (chrome.runtime.lastError) {
-          console.warn("[game-dl] Network.enable failed:", chrome.runtime.lastError.message);
-          resolve(false);
-          return;
-        }
-        debuggerAttached = true;
-        pendingNetworkCaptures.clear();
-        resolve(true);
-      });
+      enableNetwork(tabId, resolve);
     });
+  });
+}
+
+function enableNetwork(tabId, resolve) {
+  chrome.debugger.sendCommand({ tabId }, "Network.enable", {}, () => {
+    if (chrome.runtime.lastError) {
+      console.warn("[game-dl] Network.enable failed:", chrome.runtime.lastError.message);
+      resolve(false);
+      return;
+    }
+    debuggerAttached = true;
+    pendingNetworkCaptures.clear();
+    console.log("[game-dl] Network.enable OK for tab", tabId);
+    chrome.debugger.sendCommand({ tabId }, "Page.enable", {}, () => {
+      if (chrome.runtime.lastError) {
+        console.warn("[game-dl] Page.enable failed:", chrome.runtime.lastError.message);
+      } else {
+        console.log("[game-dl] Page.enable OK for tab", tabId);
+      }
+    });
+    resolve(true);
   });
 }
 
@@ -352,16 +642,25 @@ async function captureResponseBody(tabId, requestId, info) {
 
     if (isDocument) {
       bodyDecoded = result.base64Encoded ? decodeBase64Body(result.body) : result.body;
-      if (!bodyDecoded || bodyDecoded.length < 20) return;
+      console.log(`[game-dl] CDP Document body: url=${info.url.slice(0, 100)}, base64=${result.base64Encoded}, bodyLen=${bodyDecoded?.length ?? 0}, rawLen=${result.body?.length ?? 0}`);
+      if (!bodyDecoded || bodyDecoded.length < 50) {
+        console.warn(`[game-dl] CDP Document body too short or empty, skipping: ${info.url.slice(0, 100)}`);
+        return;
+      }
+      if (networkHtmlCache.size > 100) {
+        const oldest = networkHtmlCache.keys().next().value;
+        networkHtmlCache.delete(oldest);
+      }
+      networkHtmlCache.set(info.url, bodyDecoded);
+      const baseUrl = info.url.split("?")[0];
+      if (baseUrl !== info.url) networkHtmlCache.set(baseUrl, bodyDecoded);
+      console.log(`[game-dl] HTML cached via CDP: ${info.url.slice(0, 100)} (${bodyDecoded.length} bytes, total=${networkHtmlCache.size})`);
       rememberHtmlCache(info.url, bodyDecoded);
     }
 
     if (!activeSession || activeSession.tabId !== tabId) return;
-    const docOk =
-      isDocument &&
-      (shouldCaptureDocumentForCache(info.url) ||
-        isSameDocumentAsGame(activeSession.gameUrl, info.url));
-    if (!urlMatchesListen(info.url) && !docOk) {
+    if (!urlMatchesListen(info.url) && !isDocument) return;
+    if (isDocument && !urlMatchesListen(info.url) && !isSameDocumentAsGame(activeSession.gameUrl, info.url)) {
       return;
     }
 
@@ -435,7 +734,7 @@ async function captureResponseBody(tabId, requestId, info) {
     scheduleManifest();
     updateBadgeCount();
   } catch (e) {
-    console.warn("[game-dl] getResponseBody/save failed:", e.message);
+    console.warn(`[game-dl] getResponseBody/save failed: ${e.message} | url=${info.url?.slice(0, 80)} type=${info.type}`);
     if (!activeSession || activeSession.tabId !== tabId) return;
     if (!urlMatchesListen(info.url)) return;
     if (activeSession.seenUrls.has(info.url)) return;
@@ -516,6 +815,10 @@ function isSameGameHost(requestHost, gameHost) {
   return false;
 }
 
+const EXTENSIONS_CHROME_MAY_RENAME = new Set([
+  ".m4a", ".m4v", ".aac", ".oga", ".opus", ".flac", ".wma", ".m4b", ".m4p"
+]);
+
 async function processRequest(url, requestType) {
   if (!activeSession) return;
   if (!urlMatchesListen(url)) return;
@@ -528,7 +831,12 @@ async function processRequest(url, requestType) {
   activeSession.pending.add(url);
 
   try {
-    await downloadUrl(url, `${activeSession.folder}/${localPath}`);
+    const ext = extractExtFromUrl(url);
+    if (EXTENSIONS_CHROME_MAY_RENAME.has(ext)) {
+      await fetchAndDownloadAsDataUrl(url, `${activeSession.folder}/${localPath}`);
+    } else {
+      await downloadUrl(url, `${activeSession.folder}/${localPath}`);
+    }
     activeSession.downloadedLocalPaths.add(localPath);
     activeSession.stats.downloaded += 1;
     activeSession.files.push({
@@ -556,10 +864,34 @@ async function processRequest(url, requestType) {
   }
 }
 
+async function fetchAndDownloadAsDataUrl(url, filename) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`fetch ${resp.status} ${resp.statusText}`);
+  const buf = await resp.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+    binary += String.fromCharCode.apply(null, slice);
+  }
+  const dataUrl = "data:application/octet-stream;base64," + btoa(binary);
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      { url: dataUrl, filename, ...DOWNLOAD_OPTS },
+      (id) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(id);
+      }
+    );
+  });
+}
+
 async function startMonitor(tabId, config) {
   const platform = config.platform || "crazygames";
-  const gameUrl = (config.gameUrl || "").trim();
-  if (!gameUrl.startsWith("http")) throw new Error("请填写有效的游戏 URL。");
+  const rawGameUrl = (config.gameUrl || "").trim();
+  if (!rawGameUrl.startsWith("http")) throw new Error("请填写有效的游戏 URL。");
+  const gameUrl = rawGameUrl.split("?")[0];
 
   const gameName = sanitizeName(config.gameName || "game");
   const downloadDir = (config.downloadDir || "downloaded-games").trim().replace(/^\/+|\/+$/g, "");
@@ -593,6 +925,7 @@ async function startMonitor(tabId, config) {
     folder,
     downloadDir,
     gameUrl,
+    actualGameUrl: null,
     gameHost,
     gameBaseUrl,
     listenPrefixes,
@@ -609,6 +942,7 @@ async function startMonitor(tabId, config) {
   };
 
   networkHtmlCache.clear();
+  chrome.storage.local.remove("gameEntryHtml").catch(() => {});
 
   const dbgOk = await attachDebugger(tabId);
 
@@ -640,22 +974,38 @@ async function captureAndSaveHtml(tabId) {
   const gameUrl = activeSession.gameUrl;
   if (!gameUrl) throw new Error("缺少游戏 URL。");
 
-  let rawHtml = resolveGameHtmlForGenerate();
+  let rawHtml = await resolveGameHtmlForGenerate();
   if (!rawHtml) {
-    try {
-      const resp = await fetch(gameUrl, { cache: "no-store", credentials: "omit" });
-      if (resp.ok) {
-        const t = await resp.text();
-        if (t && t.length > 20) {
-          rememberHtmlCache(gameUrl, t);
-          rawHtml = t;
-        }
+    const urlsToTry = [];
+    if (activeSession.actualGameUrl) urlsToTry.push(activeSession.actualGameUrl);
+    if (!urlsToTry.includes(gameUrl)) urlsToTry.push(gameUrl);
+    const noQuery = gameUrl.split("?")[0];
+    if (!urlsToTry.includes(noQuery) && noQuery !== gameUrl) urlsToTry.push(noQuery);
+
+    for (const tryUrl of urlsToTry) {
+      if (rawHtml) break;
+      for (const cred of ["omit", "include"]) {
+        try {
+          console.log(`[game-dl] 尝试 fetch 入口 HTML: ${tryUrl.slice(0, 100)} (cred=${cred})`);
+          const resp = await fetch(tryUrl, { cache: "no-store", credentials: cred });
+          if (resp.ok) {
+            const t = await resp.text();
+            if (t && t.length > 20) {
+              rememberHtmlCache(tryUrl, t);
+              rawHtml = t;
+              break;
+            }
+          }
+        } catch (_) {}
       }
-    } catch (_) {}
+    }
   }
   if (!rawHtml) {
     throw new Error(
-      `未缓存到入口 HTML（${gameUrl.slice(0, 80)}…）。请保持监听并刷新/进入游戏，让主框架或 iframe 加载入口页后再试。`
+      `未缓存到入口 HTML（${gameUrl.slice(0, 80)}…）。\n` +
+      `实际URL: ${activeSession.actualGameUrl?.slice(0, 80) || "未检测到"}\n` +
+      `内存缓存: ${networkHtmlCache.size} 条。\n` +
+      `请确认监听后刷新了页面且游戏已加载（缓存条目 ≥1），再点生成。`
     );
   }
 
@@ -700,7 +1050,7 @@ async function stopMonitor(tabId) {
   } catch {}
 
   activeSession = null;
-  await chrome.storage.local.remove("activeSession");
+  await chrome.storage.local.remove(["activeSession", "gameEntryHtml"]);
   return result;
 }
 
@@ -711,6 +1061,8 @@ function getMonitorStatus(tabId) {
 
 function buildStatusPayload() {
   if (!activeSession) return { status: "idle" };
+  const gu = activeSession.gameUrl;
+  const entryHtmlCached = !!(gu && (networkHtmlCache.has(gu) || networkHtmlCache.has(gu.split("?")[0])));
   return {
     status: activeSession.status,
     platform: activeSession.platform,
@@ -720,6 +1072,8 @@ function buildStatusPayload() {
     fileCount: activeSession.files.length,
     gameHost: activeSession.gameHost || "",
     htmlCaptured: activeSession.htmlCaptured,
+    entryHtmlCached,
+    actualGameUrl: activeSession.actualGameUrl || "",
     networkCacheSize: networkHtmlCache.size,
     debuggerAttached,
     listenCount: activeSession.listenPrefixes?.length || 0
@@ -770,6 +1124,18 @@ async function generateIndexAndCompat(rawHtml, gameUrl) {
       getPokiSdkStub(),
       "text/javascript;charset=utf-8"
     );
+    const masterShim = await readBundledTextFile("poki-master-loader-shim.js");
+    await downloadText(
+      `${activeSession.folder}/master-loader.js`,
+      masterShim,
+      "text/javascript;charset=utf-8"
+    );
+    const unityLoaderShim = await readBundledTextFile("poki-unity-2020-loader.js");
+    await downloadText(
+      `${activeSession.folder}/unity-2020.js`,
+      unityLoaderShim,
+      "text/javascript;charset=utf-8"
+    );
     await downloadText(
       `${activeSession.folder}/interceptor.js`,
       buildInterceptorContent("poki"),
@@ -777,6 +1143,8 @@ async function generateIndexAndCompat(rawHtml, gameUrl) {
     );
     upsertFile({ type: "entry-html", sourceUrl: gameUrl, localPath: "index.html", status: "ok" });
     upsertFile({ type: "compat-script", sourceUrl: "", localPath: "poki-sdk-stub.js", status: "ok" });
+    upsertFile({ type: "compat-script", sourceUrl: "", localPath: "master-loader.js", status: "ok" });
+    upsertFile({ type: "compat-script", sourceUrl: "", localPath: "unity-2020.js", status: "ok" });
     upsertFile({ type: "compat-script", sourceUrl: "", localPath: "interceptor.js", status: "ok" });
   } else if (plat === "minigame") {
     html = neutralizeMinigameSdk(html);
@@ -800,7 +1168,7 @@ async function generateIndexAndCompat(rawHtml, gameUrl) {
   } else {
     html = neutralizeCrazyGamesSdk(html);
     html = removeDynamicLoaderContent(html, detectGameEngine());
-    const tags = '<script src="crazygames-sdk-stub.js"></script>\n<script src="interceptor.js"></script>';
+    const tags = '<script src="crazygames-sdk-stub.js"></script>\n<script src="interceptor.js"></script>\n<script src="gamepush-failsafe.js"></script>';
     html = injectAfterHead(html, tags);
     await downloadText(`${activeSession.folder}/index.html`, html, "text/html;charset=utf-8");
     await downloadText(
@@ -813,10 +1181,23 @@ async function generateIndexAndCompat(rawHtml, gameUrl) {
       buildInterceptorContent("crazygames"),
       "text/javascript;charset=utf-8"
     );
+    await downloadText(
+      `${activeSession.folder}/gamepush-failsafe.js`,
+      getGamePushFailsafeScript(),
+      "text/javascript;charset=utf-8"
+    );
     upsertFile({ type: "entry-html", sourceUrl: gameUrl, localPath: "index.html", status: "ok" });
     upsertFile({ type: "compat-script", sourceUrl: "", localPath: "crazygames-sdk-stub.js", status: "ok" });
     upsertFile({ type: "compat-script", sourceUrl: "", localPath: "interceptor.js", status: "ok" });
+    upsertFile({ type: "compat-script", sourceUrl: "", localPath: "gamepush-failsafe.js", status: "ok" });
   }
+}
+
+async function readBundledTextFile(relativePath) {
+  const url = chrome.runtime.getURL(relativePath);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`[game-dl] fetch ${relativePath}: ${r.status}`);
+  return r.text();
 }
 
 function injectAfterHead(html, scriptTags) {
@@ -835,7 +1216,11 @@ function neutralizeTrackersCommon(html) {
 function neutralizePokiSdk(html) {
   html = html
     .replace(/<script[^>]*src="[^"]*poki-sdk-hoist[^"]*"[^>]*><\/script>/gi, "")
-    .replace(/<script[^>]*src="[^"]*\/poki-sdk\.js"[^>]*><\/script>/gi, "");
+    .replace(/<script[^>]*src="[^"]*\/poki-sdk\.js"[^>]*><\/script>/gi, "")
+    .replace(
+      /<script[^>]*src="https?:\/\/game-cdn\.poki\.com\/loaders\/v\d+\/master-loader\.js"[^>]*><\/script>/gi,
+      '<script src="./master-loader.js"></script>'
+    );
   const re = /<script>(?=[\s\S]{5000})([\s\S]*?)<\/script>/gi;
   return html.replace(re, (match, content) => {
     if (
@@ -931,7 +1316,8 @@ function buildInterceptorContent(platform) {
   }
 
   const blockPoki = platform === "poki"
-    ? `if (u.includes("poki-sdk-core") || u.includes("poki-sdk-hoist"))
+    ? `if (u.includes("poki-sdk-core") || u.includes("poki-sdk-hoist")
+      || u.includes("/scripts/v2/poki-sdk") || u.includes("/scripts/v3/poki-sdk"))
       return "data:text/javascript,console.log('[game-dl] poki sdk blocked')";`
     : "";
   const blockMini =
@@ -1346,6 +1732,12 @@ function mimeForCdpSave(cdpType, ext, isBinary) {
       if (ext === ".mp4") return "video/mp4";
       if (ext === ".webm") return "video/webm";
       if (ext === ".mp3") return "audio/mpeg";
+      if (ext === ".m4a") return "audio/mp4";
+      if (ext === ".aac") return "audio/aac";
+      if (ext === ".ogg" || ext === ".oga") return "audio/ogg";
+      if (ext === ".opus") return "audio/opus";
+      if (ext === ".wav") return "audio/wav";
+      if (ext === ".flac") return "audio/flac";
       return "application/octet-stream";
     default:
       if (ext === ".json") return "application/json";
@@ -1528,6 +1920,7 @@ async function persistSession() {
     folder: activeSession.folder,
     downloadDir: activeSession.downloadDir,
     gameUrl: activeSession.gameUrl,
+    actualGameUrl: activeSession.actualGameUrl || null,
     gameHost: activeSession.gameHost,
     gameBaseUrl: activeSession.gameBaseUrl,
     listenPrefixes: activeSession.listenPrefixes,
@@ -1544,7 +1937,7 @@ async function persistSession() {
 
 async function restoreSession() {
   try {
-    const stored = await chrome.storage.local.get("activeSession");
+    const stored = await chrome.storage.local.get(["activeSession", "gameEntryHtml"]);
     const saved = stored.activeSession;
     if (!saved || saved.status !== "listening") return;
 
@@ -1560,6 +1953,13 @@ async function restoreSession() {
       fontDataUrls: saved.fontDataUrls || {}
     };
     delete activeSession.seenUrlsList;
+
+    if (stored.gameEntryHtml && activeSession.gameUrl) {
+      const gu = activeSession.gameUrl;
+      networkHtmlCache.set(gu, stored.gameEntryHtml);
+      networkHtmlCache.set(gu.split("?")[0], stored.gameEntryHtml);
+      console.log(`[game-dl] restoreSession: 从 storage 恢复入口 HTML (${stored.gameEntryHtml.length} bytes)`);
+    }
 
     if (activeSession.tabId) {
       void attachDebugger(activeSession.tabId);

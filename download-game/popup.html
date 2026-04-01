@@ -176,6 +176,77 @@
       #importFile {
         display: none;
       }
+
+      .preset-wrap {
+        margin-top: 6px;
+      }
+
+      .preset-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+
+      .preset-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        max-width: 100%;
+        padding: 4px 6px 4px 8px;
+        font-size: 11px;
+        color: #374151;
+        background: #f3f4f6;
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        cursor: pointer;
+        box-sizing: border-box;
+      }
+
+      .preset-chip:hover {
+        border-color: #c4b5fd;
+        background: #ede9fe;
+      }
+
+      .preset-chip span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+      }
+
+      .preset-chip .preset-rm {
+        flex-shrink: 0;
+        padding: 0 4px;
+        margin: 0;
+        font-size: 12px;
+        line-height: 1;
+        border: 0;
+        background: transparent;
+        color: #9ca3af;
+        cursor: pointer;
+        border-radius: 4px;
+      }
+
+      .preset-chip .preset-rm:hover {
+        color: #dc2626;
+        background: #fee2e2;
+      }
+
+      .preset-add-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+
+      .preset-add-row button {
+        flex: 0 0 auto;
+        width: auto;
+        padding: 6px 10px;
+        font-size: 11px;
+        margin: 0;
+      }
     </style>
   </head>
   <body>
@@ -201,6 +272,14 @@
 
     <label for="downloadDir">下载目录（相对浏览器下载文件夹，必填）</label>
     <input type="text" id="downloadDir" placeholder="downloaded-games" />
+    <div class="preset-wrap">
+      <div id="downloadDirPresets" class="preset-chips" aria-label="下载目录备选项"></div>
+      <div class="preset-add-row">
+        <button type="button" id="addDownloadDirPresetBtn" class="secondary">
+          将当前目录加入备选项
+        </button>
+      </div>
+    </div>
 
     <label for="gameName">游戏名称（必填，子目录名）</label>
     <input type="text" id="gameName" placeholder="my-game" />

@@ -111,6 +111,33 @@ async function appendFailed(tabId, item) {
   await chrome.storage.local.set({ [STORAGE_404]: data });
 }
 
+/**
+ * 通过 fetch + data URL 下载文件，避免 Chrome 根据 Content-Type 篡改扩展名
+ * （如 .m4a → .mp4）。
+ */
+async function fetchAndSave(sourceUrl, filename) {
+  const resp = await fetch(sourceUrl);
+  if (!resp.ok) throw new Error(`fetch ${resp.status} ${resp.statusText}`);
+  const buf = await resp.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+    binary += String.fromCharCode.apply(null, slice);
+  }
+  const dataUrl = "data:application/octet-stream;base64," + btoa(binary);
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      { url: dataUrl, filename, conflictAction: "overwrite", saveAs: false },
+      (downloadId) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(downloadId);
+      }
+    );
+  });
+}
+
 /** 监听到 404 时自动下载单个资源 */
 async function autoDownloadOne(tabId, pageUrl, entry) {
   const settings = await getSettings();
@@ -136,15 +163,7 @@ async function autoDownloadOne(tabId, pageUrl, entry) {
   const filename = `${downloadDir}/${gameName}/${relForFile}`;
 
   try {
-    await new Promise((resolve, reject) => {
-      chrome.downloads.download(
-        { url: sourceUrl, filename, conflictAction: "overwrite", saveAs: false },
-        (downloadId) => {
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else resolve(downloadId);
-        }
-      );
-    });
+    await fetchAndSave(sourceUrl, filename);
   } catch (e) {
     await appendFailed(tabId, {
       url: sourceUrl,
@@ -343,21 +362,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const rel = (item.relativePath || item.path || "").replace(/^\//, "");
         if (!rel) continue;
         const sourceUrl = `${baseDomain}/${rel}`;
-        const filename = `${downloadDir}/${resolvedGameName}/${rel}`;
+        let relForFile = rel;
+        try { relForFile = decodeURIComponent(rel); } catch {}
+        const filename = `${downloadDir}/${resolvedGameName}/${relForFile}`;
 
         try {
-          await new Promise((resolve, reject) => {
-            chrome.downloads.download(
-              { url: sourceUrl, filename, conflictAction: "overwrite", saveAs: false },
-              (downloadId) => {
-                if (chrome.runtime.lastError) {
-                  reject(new Error(chrome.runtime.lastError.message));
-                } else {
-                  resolve(downloadId);
-                }
-              }
-            );
-          });
+          await fetchAndSave(sourceUrl, filename);
           downloaded.push({ url: sourceUrl, relativePath: rel, filename });
         } catch (e) {
           failed.push({

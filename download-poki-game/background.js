@@ -615,11 +615,12 @@ async function captureAndSaveHtml(tabId) {
 
   await generateIndexHtml(rawHtml, gameUrl);
   await generateSdkStubFile();
+  await generatePokiLoaderShimFiles();
 
   activeSession.htmlCaptured = true;
   await persistSession();
 
-  return { message: "已生成 index.html、poki-sdk-stub.js" };
+  return { message: "已生成 index.html、poki-sdk-stub.js、master-loader.js、unity-2020.js" };
 }
 
 async function stopMonitor(tabId) {
@@ -734,6 +735,41 @@ async function generateSdkStubFile() {
   });
 }
 
+async function readBundledTextFile(relativePath) {
+  const url = chrome.runtime.getURL(relativePath);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`[poki-dl] fetch ${relativePath}: ${r.status}`);
+  return r.text();
+}
+
+/** 官方 master-loader v2/v3 会先加载 poki-sdk.js，覆盖桩；写入本地 shim（与 happy-glass 离线方案一致） */
+async function generatePokiLoaderShimFiles() {
+  const masterShim = await readBundledTextFile("poki-master-loader-shim.js");
+  await downloadText(
+    `${activeSession.folder}/master-loader.js`,
+    masterShim,
+    "text/javascript;charset=utf-8"
+  );
+  upsertFile({
+    type: "compat-script",
+    sourceUrl: "",
+    localPath: "master-loader.js",
+    status: "ok"
+  });
+  const unityLoader = await readBundledTextFile("poki-unity-2020-loader.js");
+  await downloadText(
+    `${activeSession.folder}/unity-2020.js`,
+    unityLoader,
+    "text/javascript;charset=utf-8"
+  );
+  upsertFile({
+    type: "compat-script",
+    sourceUrl: "",
+    localPath: "unity-2020.js",
+    status: "ok"
+  });
+}
+
 async function generateInterceptorFile() {
   const content = buildInterceptorContent();
   await downloadText(
@@ -803,8 +839,11 @@ function buildSdkStubContent() {
   }, 2000);
   setTimeout(function() { clearInterval(_hlTimer); }, 30000);
 
-  window.PokiSDK = {
-    init: _pp,
+  var _pokiStub = {
+    init: function() {
+      window.PokiSDK_OK = true;
+      return Promise.resolve();
+    },
     gameplayStart: _pn,
     gameplayStop: _pn,
     commercialBreak: _pp,
@@ -829,7 +868,17 @@ function buildSdkStubContent() {
     togglePlayerAdvertisingConsent: _pn,
     disableDOMChangeObservation: _pn
   };
-  console.log("[poki-dl] PokiSDK stub active");
+  try { Object.freeze(_pokiStub); } catch (e) {}
+  try {
+    Object.defineProperty(window, "PokiSDK", {
+      value: _pokiStub,
+      writable: false,
+      configurable: false
+    });
+  } catch (e) {
+    window.PokiSDK = _pokiStub;
+  }
+  console.log("[poki-dl] PokiSDK stub active (sealed)");
 
   var _origGBI = Document.prototype.getElementById;
   Document.prototype.getElementById = function(id) {
@@ -875,7 +924,8 @@ function buildInterceptorContent() {
 
   function rw(u) {
     if (!u || u.startsWith("data:") || u.startsWith("blob:")) return u;
-    if (u.includes("poki-sdk-core") || u.includes("poki-sdk-hoist"))
+    if (u.includes("poki-sdk-core") || u.includes("poki-sdk-hoist")
+      || u.includes("/scripts/v2/poki-sdk") || u.includes("/scripts/v3/poki-sdk"))
       return "data:text/javascript,console.log('[poki-dl] sdk blocked')";
     try {
       var o = new URL(u, location.href);
@@ -1081,7 +1131,11 @@ function rewriteRemainingAbsoluteUrls(html, gameBaseUrl) {
 function neutralizePokiSdk(html) {
   html = html
     .replace(/<script[^>]*src="[^"]*poki-sdk-hoist[^"]*"[^>]*><\/script>/gi, "")
-    .replace(/<script[^>]*src="[^"]*\/poki-sdk\.js"[^>]*><\/script>/gi, "");
+    .replace(/<script[^>]*src="[^"]*\/poki-sdk\.js"[^>]*><\/script>/gi, "")
+    .replace(
+      /<script[^>]*src="https?:\/\/game-cdn\.poki\.com\/loaders\/v\d+\/master-loader\.js"[^>]*><\/script>/gi,
+      '<script src="./master-loader.js"></script>'
+    );
   return stripPokiAdapterScript(html);
 }
 
