@@ -1,6 +1,6 @@
 # Fix Game Resources（404 资源补全）
 
-在本地运行已下载游戏（如 `download-mini-games/jelly-crush`、poki 游戏等）时，自动监听页面中的 **404 请求**，并从远程游戏域名拉取对应资源并保存到本地，实现缺失资源补全。
+在本地运行已下载游戏（如 `download-mini-games/jelly-crush`、poki 游戏等）时，自动监听页面中的 **404 请求**，并从远程游戏域名拉取对应资源并保存到本地，实现缺失资源补全。sdsd
 
 ## 使用步骤
 
