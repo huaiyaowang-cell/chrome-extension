@@ -1,6 +1,8 @@
+import * as localSink from "./local-sink.js";
+
 const OUTPUT_PREFIX = "downloaded-games";
 
-/** 下载选项：重名直接覆盖，不弹「另存为」对话框 */
+/** 下载选项：chrome.downloads 回退时使用 */
 const DOWNLOAD_OPTS = { conflictAction: "overwrite", saveAs: false };
 
 const TRACKER_KEYWORDS = [
@@ -30,7 +32,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then(() =>
         startMonitor(message.tabId, {
           manualGameUrl: message.manualGameUrl || null,
-          manualResourceUrls: message.manualResourceUrls || []
+          manualResourceUrls: message.manualResourceUrls || [],
+          sinkSettings: message.sinkSettings || null
         })
       )
       .then((r) => sendResponse({ ok: true, ...r }))
@@ -79,6 +82,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "DOWNLOAD_ASSET") {
     sessionReady
       .then(() => downloadExtraAsset(message.tabId, message.url, message.assetKey))
+      .then((r) => sendResponse({ ok: true, ...r }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  if (message?.type === "CHECK_SINK_HEALTH") {
+    sessionReady
+      .then(async () => {
+        await localSink.loadSettings(message.sinkSettings || {});
+        if (!localSink.isEnabled()) {
+          return { mode: "chrome-downloads", message: "已关闭本地服务，将使用 Chrome 下载" };
+        }
+        return localSink.pingServer(message.sinkSettings || {});
+      })
       .then((r) => sendResponse({ ok: true, ...r }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -267,17 +283,19 @@ async function captureResponseBody(tabId, requestId, info) {
       : !result.body && !(isDocument && bodyDecoded);
     if (bodyEmpty) {
       try {
-        await downloadUrl(info.url, filename);
-        activeSession.downloadedLocalPaths.add(localPath);
+        await downloadUrl(info.url, filename, type);
         activeSession.seenUrls.add(info.url);
-        activeSession.stats.downloaded += 1;
-        activeSession.files.push({
-          type: "asset",
-          sourceUrl: info.url,
-          localPath,
-          status: "ok",
-          requestType: type
-        });
+        if (!localSink.isEnabled()) {
+          activeSession.downloadedLocalPaths.add(localPath);
+          activeSession.stats.downloaded += 1;
+          activeSession.files.push({
+            type: "asset",
+            sourceUrl: info.url,
+            localPath,
+            status: "ok",
+            requestType: type
+          });
+        }
         console.log(`[poki-dl] CDP body 为空，直链下载: ${info.url.slice(0, 80)} -> ${localPath}`);
         schedulePersist();
         scheduleManifest();
@@ -299,25 +317,19 @@ async function captureResponseBody(tabId, requestId, info) {
     if (type === "Font" && activeSession && localPath) {
       activeSession.fontDataUrls[localPath] = dataUrl;
     }
-    await new Promise((resolve, reject) => {
-      chrome.downloads.download(
-        { url: dataUrl, filename, ...DOWNLOAD_OPTS },
-        (id) => {
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else resolve(id);
-        }
-      );
-    });
-    activeSession.downloadedLocalPaths.add(localPath);
+    await saveDataUrl(localPath, dataUrl, info.url, type);
     activeSession.seenUrls.add(info.url);
-    activeSession.stats.downloaded += 1;
-    activeSession.files.push({
-      type: "asset",
-      sourceUrl: info.url,
-      localPath,
-      status: "ok",
-      requestType: type
-    });
+    if (!localSink.isEnabled()) {
+      activeSession.downloadedLocalPaths.add(localPath);
+      activeSession.stats.downloaded += 1;
+      activeSession.files.push({
+        type: "asset",
+        sourceUrl: info.url,
+        localPath,
+        status: "ok",
+        requestType: type
+      });
+    }
     console.log(`[poki-dl] CDP 保存: ${info.url.slice(0, 100)} -> ${localPath}`);
     schedulePersist();
     scheduleManifest();
@@ -342,17 +354,19 @@ async function captureResponseBody(tabId, requestId, info) {
     }
     const filename = `${activeSession.folder}/${localPath}`;
     try {
-      await downloadUrl(info.url, filename);
-      activeSession.downloadedLocalPaths.add(localPath);
+      await downloadUrl(info.url, filename, type);
       activeSession.seenUrls.add(info.url);
-      activeSession.stats.downloaded += 1;
-      activeSession.files.push({
-        type: "asset",
-        sourceUrl: info.url,
-        localPath,
-        status: "ok",
-        requestType: type
-      });
+      if (!localSink.isEnabled()) {
+        activeSession.downloadedLocalPaths.add(localPath);
+        activeSession.stats.downloaded += 1;
+        activeSession.files.push({
+          type: "asset",
+          sourceUrl: info.url,
+          localPath,
+          status: "ok",
+          requestType: type
+        });
+      }
       console.log(`[poki-dl] CDP 失败后直链下载: ${info.url.slice(0, 80)} -> ${localPath}`);
       schedulePersist();
       scheduleManifest();
@@ -486,27 +500,31 @@ async function processRequest(url, requestType) {
 
   console.log("[poki-dl] 下载:", url.slice(0, 120));
   try {
-    await downloadUrl(url, `${activeSession.folder}/${localPath}`);
-    activeSession.downloadedLocalPaths.add(localPath);
-    activeSession.stats.downloaded += 1;
-    activeSession.files.push({
-      type: "asset",
-      sourceUrl: url,
-      localPath,
-      status: "ok",
-      requestType
-    });
+    await downloadUrl(url, `${activeSession.folder}/${localPath}`, requestType);
+    if (!localSink.isEnabled()) {
+      activeSession.downloadedLocalPaths.add(localPath);
+      activeSession.stats.downloaded += 1;
+      activeSession.files.push({
+        type: "asset",
+        sourceUrl: url,
+        localPath,
+        status: "ok",
+        requestType
+      });
+    }
     await updateBadgeCount();
   } catch (error) {
-    activeSession.stats.failed += 1;
-    activeSession.files.push({
-      type: "asset",
-      sourceUrl: url,
-      localPath,
-      status: "failed",
-      requestType,
-      error: String(error?.message || error)
-    });
+    if (!localSink.isEnabled()) {
+      activeSession.stats.failed += 1;
+      activeSession.files.push({
+        type: "asset",
+        sourceUrl: url,
+        localPath,
+        status: "failed",
+        requestType,
+        error: String(error?.message || error)
+      });
+    }
   } finally {
     activeSession.pending.delete(url);
     schedulePersist();
@@ -517,7 +535,7 @@ async function processRequest(url, requestType) {
 /* ── Monitor lifecycle ─────────────────────────────────────── */
 
 async function startMonitor(tabId, options = {}) {
-  const { manualGameUrl, manualResourceUrls = [] } = options;
+  const { manualGameUrl, manualResourceUrls = [], sinkSettings = null } = options;
 
   const pageInfo = await getPageInfoFromTab(tabId);
   if (!pageInfo?.pageUrl) throw new Error("无法读取页面信息。");
@@ -535,6 +553,10 @@ async function startMonitor(tabId, options = {}) {
   const gameName = sanitizeName(pageInfo.gameName || "poki-game");
   const folder = `${OUTPUT_PREFIX}/${gameName}`;
 
+  localSink.clearSession();
+  const sinkReady = await localSink.ensureReady(sinkSettings || {});
+  const useLocalSink = localSink.isEnabled();
+
   activeSession = {
     tabId,
     gameName,
@@ -550,11 +572,26 @@ async function startMonitor(tabId, options = {}) {
     /** 当前监听会话中已下载的本地路径，用于去重，避免同一文件重复下载 */
     downloadedLocalPaths: new Set(),
     stats: { totalSeen: 0, downloaded: 0, failed: 0, skipped: 0 },
+    sinkMode: "chrome-downloads",
+    localSessionId: null,
     files: [],
     htmlCaptured: false,
     /** 字体 data URL，用于生成 index 时内联，避免 file:// 下无法加载 */
-    fontDataUrls: {}
+    fontDataUrls: {},
+    sinkMode: useLocalSink ? "local-server" : "chrome-downloads",
+    localSessionId: null
   };
+
+  if (useLocalSink) {
+    const started = await localSink.startSession({
+      gameName,
+      relPrefix: folder,
+      pageUrl: pageInfo.pageUrl,
+      gameUrl: manualGameUrl && manualGameUrl.startsWith("http") ? manualGameUrl : ""
+    });
+    activeSession.localSessionId = started.sessionId;
+    console.log("[poki-dl] 本地服务会话:", started.sessionId, started.gameDir);
+  }
 
   requestBuffer = [];
   networkHtmlCache.clear();
@@ -593,12 +630,22 @@ async function startMonitor(tabId, options = {}) {
     }, 500);
   }
 
-  return { gameName, folder, status: "listening", debugger: dbgOk };
+  return {
+    gameName,
+    folder,
+    status: "listening",
+    debugger: dbgOk,
+    sinkMode: activeSession.sinkMode
+  };
 }
 
 async function captureAndSaveHtml(tabId) {
   if (!activeSession || activeSession.tabId !== tabId) {
     throw new Error("当前没有监听会话。");
+  }
+
+  if (localSink.isEnabled()) {
+    await ensureLocalSinkSession();
   }
 
   const gameUrl = activeSession.gameUrl;
@@ -647,10 +694,29 @@ async function stopMonitor(tabId) {
   activeSession.stoppedAt = new Date().toISOString();
 
   try {
+    if (localSink.isEnabled()) {
+      await localSink.flushQueue();
+    }
     await writeManifest();
+    if (localSink.isEnabled() && activeSession.localSessionId) {
+      const manifest = {
+        gameName: activeSession.gameName,
+        pageUrl: activeSession.pageUrl,
+        gameUrl: activeSession.gameUrl || "",
+        engine: detectGameEngine(),
+        startedAt: activeSession.startedAt,
+        stoppedAt: activeSession.stoppedAt,
+        status: activeSession.status,
+        stats: activeSession.stats,
+        files: activeSession.files
+      };
+      await localSink.finishSession(manifest);
+    }
   } catch (e) {
     errors.push(`writeManifest: ${e.message}`);
   }
+
+  localSink.clearSession();
 
   const result = buildStatusPayload();
   if (errors.length > 0) result.warnings = errors;
@@ -839,36 +905,67 @@ function buildSdkStubContent() {
   }, 2000);
   setTimeout(function() { clearInterval(_hlTimer); }, 30000);
 
-  var _pokiStub = {
+  function _breakWithCb(cb) {
+    if (typeof cb === "function") {
+      try { cb(); } catch (e) {}
+    }
+    return Promise.resolve();
+  }
+  function _rewardedWithCb(cb) {
+    if (typeof cb === "function") {
+      try { cb(); } catch (e) {}
+    }
+    return Promise.resolve(true);
+  }
+
+  var _pokiBase = {
     init: function() {
       window.PokiSDK_OK = true;
       return Promise.resolve();
     },
-    gameplayStart: _pn,
-    gameplayStop: _pn,
-    commercialBreak: _pp,
-    rewardedBreak: function() { return Promise.resolve(true); },
-    displayAd: _pn,
-    destroyAd: _pn,
     setDebug: _pn,
-    getURLParam: function() { return ""; },
-    shareableURL: function() { return Promise.resolve(""); },
-    isAdBlocked: function() { return false; },
+    setLogging: _pn,
     gameLoadingStart: _pn,
     gameLoadingFinished: _hideLoading,
     gameLoadingProgress: _pn,
     gameInteractive: _hideLoading,
+    gameplayStart: _pn,
+    gameplayStop: _pn,
+    commercialBreak: _breakWithCb,
+    rewardedBreak: _rewardedWithCb,
+    measure: _pn,
+    captureError: _pn,
+    logError: _pn,
     customEvent: _pn,
     happyTime: _pn,
-    logError: _pn,
     roundStart: _pn,
     roundEnd: _pn,
+    displayAd: _pn,
+    destroyAd: _pn,
     muteAd: _pn,
+    getURLParam: function() { return ""; },
+    shareableURL: function() { return Promise.resolve(""); },
+    isAdBlocked: function() { return false; },
     sendHighscore: _pn,
     togglePlayerAdvertisingConsent: _pn,
-    disableDOMChangeObservation: _pn
+    disableDOMChangeObservation: _pn,
+    movePill: _pn,
+    openExternalLink: _pn,
+    playtestSetCanvas: _pn,
+    playtestCaptureHtmlOnce: _pn,
+    playtestCaptureHtmlForce: _pn,
+    playtestCaptureHtmlOn: _pn,
+    playtestCaptureHtmlOff: _pn
   };
-  try { Object.freeze(_pokiStub); } catch (e) {}
+
+  var _pokiStub = new Proxy(_pokiBase, {
+    get: function(target, prop) {
+      if (prop in target) return target[prop];
+      if (prop === "then" || typeof prop === "symbol") return undefined;
+      return _pn;
+    }
+  });
+
   try {
     Object.defineProperty(window, "PokiSDK", {
       value: _pokiStub,
@@ -878,7 +975,7 @@ function buildSdkStubContent() {
   } catch (e) {
     window.PokiSDK = _pokiStub;
   }
-  console.log("[poki-dl] PokiSDK stub active (sealed)");
+  console.log("[poki-dl] PokiSDK stub active (proxy)");
 
   var _origGBI = Document.prototype.getElementById;
   Document.prototype.getElementById = function(id) {
@@ -1307,9 +1404,9 @@ async function downloadExtraAsset(tabId, url, assetKey) {
   const localPath = `__assets__/${filename}`;
   const fullPath = `${folder}/${localPath}`;
 
-  await downloadUrl(url, fullPath);
+  await downloadUrl(url, fullPath, "extra-asset");
 
-  if (activeSession) {
+  if (activeSession && !localSink.isEnabled()) {
     upsertFile({
       type: "extra-asset",
       sourceUrl: url,
@@ -1318,6 +1415,9 @@ async function downloadExtraAsset(tabId, url, assetKey) {
       assetKey
     });
     activeSession.stats.downloaded += 1;
+    schedulePersist();
+    scheduleManifest();
+  } else if (activeSession) {
     schedulePersist();
     scheduleManifest();
   }
@@ -1352,20 +1452,22 @@ async function downloadManualResources(tabId, urls) {
       continue;
     }
     try {
-      await downloadUrl(url, `${folder}/${localPath}`);
+      await downloadUrl(url, `${folder}/${localPath}`, "manual");
       downloaded += 1;
       if (activeSession) {
-        activeSession.downloadedLocalPaths.add(localPath);
         activeSession.seenUrls.add(url);
-        activeSession.stats.downloaded += 1;
-        upsertFile({ type: "asset", sourceUrl: url, localPath, status: "ok", requestType: "manual" });
+        if (!localSink.isEnabled()) {
+          activeSession.downloadedLocalPaths.add(localPath);
+          activeSession.stats.downloaded += 1;
+          upsertFile({ type: "asset", sourceUrl: url, localPath, status: "ok", requestType: "manual" });
+        }
         schedulePersist();
         scheduleManifest();
         updateBadgeCount();
       }
     } catch (err) {
       console.warn(`[poki-dl] manual resource failed: ${url}`, err.message);
-      if (activeSession) {
+      if (activeSession && !localSink.isEnabled()) {
         activeSession.stats.failed += 1;
         upsertFile({
           type: "asset",
@@ -1473,7 +1575,113 @@ function mimeForCdpSave(cdpType, ext, isBinary) {
 
 /* ── Download helpers ──────────────────────────────────────── */
 
-async function downloadUrl(url, filename) {
+async function ensureLocalSinkSession() {
+  if (!localSink.isEnabled() || !activeSession) return;
+  await localSink.loadSettings();
+  if (localSink.getSessionId()) return;
+  const started = await localSink.resumeSession({
+    gameName: activeSession.gameName,
+    relPrefix: activeSession.folder,
+    pageUrl: activeSession.pageUrl,
+    gameUrl: activeSession.gameUrl || ""
+  });
+  activeSession.localSessionId = started.sessionId;
+  console.log("[poki-dl] 本地会话已恢复:", started.sessionId);
+}
+
+function toRelPath(filename) {
+  const folder = activeSession?.folder;
+  if (folder && filename.startsWith(`${folder}/`)) {
+    return filename.slice(folder.length + 1);
+  }
+  const slash = filename.indexOf("/");
+  return slash >= 0 ? filename.slice(slash + 1) : filename;
+}
+
+function applyIngestResult(result, sourceUrl, localPath, requestType) {
+  if (!activeSession || !result) return;
+  if (result.status === "skipped") {
+    activeSession.stats.skipped += 1;
+    activeSession.downloadedLocalPaths.add(localPath);
+    upsertFile({
+      type: "asset",
+      sourceUrl: sourceUrl || "",
+      localPath,
+      status: "ok",
+      requestType,
+      skipped: true
+    });
+    return;
+  }
+  if (result.status === "ok") {
+    activeSession.stats.downloaded += 1;
+    activeSession.downloadedLocalPaths.add(localPath);
+    upsertFile({
+      type: "asset",
+      sourceUrl: sourceUrl || "",
+      localPath,
+      status: "ok",
+      requestType
+    });
+    return;
+  }
+  activeSession.stats.failed += 1;
+  upsertFile({
+    type: "asset",
+    sourceUrl: sourceUrl || "",
+    localPath,
+    status: "failed",
+    requestType,
+    error: result.error || "ingest failed"
+  });
+}
+
+function findIngestResult(results, relPath) {
+  if (!Array.isArray(results)) return null;
+  return results.find((r) => r.relPath === relPath) || results[results.length - 1];
+}
+
+async function saveDataUrl(localPath, dataUrl, sourceUrl = "", requestType = "data-url") {
+  if (!localSink.isEnabled()) {
+    return downloadUrl(dataUrl, `${activeSession.folder}/${localPath}`, requestType);
+  }
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) throw new Error("invalid data URL");
+  const meta = dataUrl.slice(0, comma);
+  const body = dataUrl.slice(comma + 1);
+  const encoding = meta.includes(";base64") ? "base64" : "utf8";
+  await ensureLocalSinkSession();
+  await localSink.flushQueue();
+  const result = await localSink.ingestImmediate({
+    relPath: localPath,
+    body,
+    encoding,
+    overwrite: true
+  });
+  applyIngestResult(result, sourceUrl, localPath, requestType);
+  if (result?.status === "failed") {
+    throw new Error(result.error || "ingest failed");
+  }
+  if (result?.status === "skipped") {
+    throw new Error(`生成文件未写入（已跳过）: ${localPath}`);
+  }
+}
+
+async function downloadUrl(url, filename, requestType = "url") {
+  const localPath = toRelPath(filename);
+  if (localSink.isEnabled()) {
+    await ensureLocalSinkSession();
+    localSink.enqueueUrl(url, localPath);
+    const data = await localSink.flushQueue();
+    const result = findIngestResult(data?.results, localPath);
+    if (result) {
+      applyIngestResult(result, url, localPath, requestType);
+      if (result.status === "failed") {
+        throw new Error(result.error || "ingest failed");
+      }
+    }
+    return;
+  }
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
       { url, filename, ...DOWNLOAD_OPTS },
@@ -1489,6 +1697,20 @@ async function downloadUrl(url, filename) {
 }
 
 async function downloadText(filename, textContent, mimeType) {
+  const localPath = toRelPath(filename);
+  if (localSink.isEnabled()) {
+    await ensureLocalSinkSession();
+    await localSink.flushQueue();
+    const result = await localSink.saveText(localPath, textContent, { overwrite: true });
+    applyIngestResult(result, "", localPath, "text");
+    if (result?.status === "failed") {
+      throw new Error(result.error || `写入失败: ${localPath}`);
+    }
+    if (result?.status === "skipped") {
+      throw new Error(`生成文件未写入（已跳过）: ${localPath}`);
+    }
+    return;
+  }
   const bytes = new TextEncoder().encode(textContent);
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {
@@ -1536,7 +1758,8 @@ function buildStatusPayload() {
     htmlCaptured: activeSession.htmlCaptured,
     networkCacheSize: networkHtmlCache.size,
     debuggerAttached,
-    bufferSize: requestBuffer.length
+    bufferSize: requestBuffer.length,
+    sinkMode: activeSession.sinkMode || "chrome-downloads"
   };
 }
 
@@ -1581,7 +1804,9 @@ async function persistSession() {
     seenUrlsList: Array.from(activeSession.seenUrls),
     files: activeSession.files,
     htmlCaptured: activeSession.htmlCaptured,
-    fontDataUrls: activeSession.fontDataUrls || {}
+    fontDataUrls: activeSession.fontDataUrls || {},
+    sinkMode: activeSession.sinkMode,
+    localSessionId: activeSession.localSessionId
   };
   await chrome.storage.local.set({ activeSession: serializable });
 }
@@ -1601,9 +1826,27 @@ async function restoreSession() {
       seenUrls: new Set(saved.seenUrlsList || []),
       pending: new Set(),
       downloadedLocalPaths: downloadedPaths,
-      fontDataUrls: saved.fontDataUrls || {}
+      fontDataUrls: saved.fontDataUrls || {},
+      sinkMode: saved.sinkMode || "chrome-downloads",
+      localSessionId: saved.localSessionId || null
     };
     delete activeSession.seenUrlsList;
+
+    await localSink.loadSettings();
+    if (localSink.isEnabled() && activeSession.folder) {
+      try {
+        const started = await localSink.startSession({
+          gameName: activeSession.gameName,
+          relPrefix: activeSession.folder,
+          pageUrl: activeSession.pageUrl,
+          gameUrl: activeSession.gameUrl || ""
+        });
+        activeSession.localSessionId = started.sessionId;
+        activeSession.sinkMode = "local-server";
+      } catch (e) {
+        console.warn("[poki-dl] 恢复本地会话失败:", e.message);
+      }
+    }
 
     if (activeSession.tabId) {
       void attachDebugger(activeSession.tabId);

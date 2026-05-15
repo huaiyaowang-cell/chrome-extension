@@ -175,6 +175,31 @@
         border-color: #2563eb;
       }
 
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        margin: 8px 0;
+        cursor: pointer;
+      }
+
+      .field-label {
+        display: block;
+        font-size: 11px;
+        color: #6b7280;
+        margin: 8px 0 4px;
+      }
+
+      .sink-test-btn {
+        margin-top: 8px;
+      }
+
+      .sink-fixed-info code {
+        word-break: break-all;
+        font-size: 10px;
+      }
+
       .resource-row {
         display: flex;
         gap: 6px;
@@ -220,6 +245,11 @@
       #importFile {
         display: none;
       }
+
+      .sink-fixed-info code {
+        word-break: break-all;
+        font-size: 10px;
+      }
     </style>
   </head>
   <body>
@@ -228,6 +258,21 @@
       <button type="button" id="clearConfigBtn" class="secondary clear-config-btn">清空配置</button>
     </div>
     <p>先开启监听，再刷新页面进入游戏。<br/>检测到游戏后资源自动下载。<br/>游戏加载完成后点「生成 HTML」或直接停止。<br/><strong>若仍无下载</strong>：填写「游戏地址」或「指定下载的静态资源」后重新开始监听。</p>
+
+    <div class="config-section">
+      <h2>本地写盘服务</h2>
+      <p class="config-desc">在仓库根目录执行 <code>npm run poki-server</code>。输出目录由服务决定，两个扩展共用同一配置。已存在文件会跳过，避免 Chrome 下载弹窗。</p>
+      <label class="checkbox-row">
+        <input type="checkbox" id="useLocalSink" checked />
+        使用本地服务写盘（推荐）
+      </label>
+      <p class="config-desc sink-fixed-info">
+        服务地址：<code id="sinkServerInfo">http://127.0.0.1:22222</code><br/>
+        输出目录（由 <code>npm run poki-server</code> 决定，不可修改）：<br/>
+        <code id="sinkOutputInfo">—</code>
+      </p>
+      <button type="button" id="testSinkBtn" class="secondary" style="margin-top:8px">检测本地服务</button>
+    </div>
 
     <div class="config-section">
       <h2>游戏地址（可选）</h2>
@@ -275,7 +320,7 @@
       </div>
     </div>
 
-    <div class="hint">文件名路径前缀：downloaded-games/&lt;game-name&gt;/</div>
+    <div class="hint">本地服务：{输出根目录}/downloaded-games/&lt;game-name&gt;/</div>
     <script src="popup.js"></script>
   </body>
 </html>

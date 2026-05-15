@@ -115,23 +115,55 @@
       .status-msg.info { background: #dbeafe; color: #1e40af; }
       .status-msg.error { background: #fee2e2; color: #b91c1c; }
       .status-msg.ok { background: #d1fae5; color: #065f46; }
+      .top-hint { margin: 0 0 10px; line-height: 1.4; }
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 8px 0;
+        cursor: pointer;
+      }
+      .sink-section { margin-top: 0; border-top: 0; padding-top: 0; }
+      .sink-fixed-info code {
+        word-break: break-all;
+        font-size: 10px;
+      }
     </style>
   </head>
   <body>
     <h1>补全 404 资源</h1>
+    <p class="hint top-hint">与 download-poki-game 共用本地服务。落盘：<code>{输出根}/downloaded-games/&lt;游戏名&gt;/</code></p>
+
+    <div class="section sink-section">
+      <div class="section-title">本地写盘</div>
+      <label class="checkbox-row">
+        <input type="checkbox" id="useLocalSink" checked />
+        使用本地服务（npm run poki-server）
+      </label>
+      <p class="hint sink-fixed-info">
+        服务地址：<code id="sinkServerInfo">http://127.0.0.1:22222</code><br/>
+        输出目录（由 <code>npm run poki-server</code> 决定，不可修改）：<br/>
+        <code id="sinkOutputInfo">—</code>
+      </p>
+      <div class="btn-row">
+        <button type="button" class="secondary" id="testSinkBtn">检测服务</button>
+        <button type="button" class="secondary" id="importManifestBtn">读 manifest</button>
+      </div>
+    </div>
+
     <div class="form-row">
-      <label>游戏地址/域名</label>
+      <label>游戏 CDN 根地址</label>
       <input type="text" id="domain" placeholder="minigame 或 Poki 完整地址均可" />
     </div>
     <div class="form-row">
       <label>下载目录</label>
-      <input type="text" id="downloadDir" placeholder="download-mini-games" />
+      <input type="text" id="downloadDir" value="downloaded-games" placeholder="downloaded-games" />
     </div>
     <div class="form-row">
       <label>游戏名（可选）</label>
       <input type="text" id="gameName" placeholder="从当前页 URL 解析" />
     </div>
-    <p class="hint">支持 minigame 域名或 Poki 完整地址（如 …gdn.poki.com/xxx-xxx/index.html，会自动转为根地址）。游戏名可从当前页解析；开始监听后 404 将自动下载补全。</p>
+    <p class="hint">开始监听后，会根据当前页 URL 自动读取同目录 <code>assets-manifest.json</code> 的 <code>gameUrl</code>（去掉参数）与游戏名；切换游戏页时自动更新。</p>
     <div class="btn-row">
       <button type="button" id="saveSettings">保存设置</button>
       <button type="button" id="toggleListen">开始监听</button>

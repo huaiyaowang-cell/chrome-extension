@@ -9,8 +9,14 @@ const exportConfigBtn = document.getElementById("exportConfigBtn");
 const importConfigBtn = document.getElementById("importConfigBtn");
 const importFileEl = document.getElementById("importFile");
 const clearConfigBtn = document.getElementById("clearConfigBtn");
+const useLocalSinkEl = document.getElementById("useLocalSink");
+const sinkServerInfoEl = document.getElementById("sinkServerInfo");
+const sinkOutputInfoEl = document.getElementById("sinkOutputInfo");
+const testSinkBtn = document.getElementById("testSinkBtn");
 
 const POPUP_CONFIG_KEY = "popupConfig";
+const SINK_SETTINGS_KEY = "pokiSinkSettings";
+const DEFAULT_SERVER_URL = "http://127.0.0.1:22222";
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -60,7 +66,9 @@ function renderStatus(result) {
     "状态: 监听中",
     `游戏: ${result.gameName}`,
     gameLine,
+    `写盘: ${result.sinkMode === "local-server" ? "本地服务" : "Chrome 下载"}`,
     `已下载: ${s.downloaded || 0}`,
+    `已跳过: ${s.skipped || 0}`,
     `失败: ${s.failed || 0}`,
     `总请求: ${s.totalSeen || 0}`,
     `文件数: ${result.fileCount || 0}`,
@@ -100,12 +108,51 @@ function getManualResourceUrls() {
     .filter(Boolean);
 }
 
+function getSinkSettings() {
+  return { enabled: !!useLocalSinkEl?.checked };
+}
+
+function saveSinkPreference() {
+  return chrome.storage.local.set({
+    [SINK_SETTINGS_KEY]: { enabled: !!useLocalSinkEl?.checked }
+  });
+}
+
 function savePopupConfig() {
   const manualGameUrl = manualGameUrlEl.value.trim() || null;
   const manualResourceUrls = getManualResourceUrls();
   chrome.storage.local.set({
     [POPUP_CONFIG_KEY]: { manualGameUrl, manualResourceUrls }
   });
+  return saveSinkPreference();
+}
+
+async function loadSinkSettings() {
+  const stored = await chrome.storage.local.get(SINK_SETTINGS_KEY);
+  const sink = stored[SINK_SETTINGS_KEY] || {};
+  if (useLocalSinkEl) useLocalSinkEl.checked = sink.enabled !== false;
+  await refreshSinkInfoDisplay();
+}
+
+async function refreshSinkInfoDisplay() {
+  if (sinkServerInfoEl) sinkServerInfoEl.textContent = DEFAULT_SERVER_URL;
+  if (!useLocalSinkEl?.checked) {
+    if (sinkOutputInfoEl) sinkOutputInfoEl.textContent = "（未启用）";
+    return null;
+  }
+  try {
+    const res = await fetch(`${DEFAULT_SERVER_URL}/health`);
+    const data = await res.json();
+    if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+    const root = data.defaultOutputRoot || "—";
+    if (sinkOutputInfoEl) sinkOutputInfoEl.textContent = root;
+    return data;
+  } catch (e) {
+    if (sinkOutputInfoEl) {
+      sinkOutputInfoEl.textContent = "无法连接，请先执行 npm run poki-server";
+    }
+    return null;
+  }
 }
 
 async function loadPopupConfig() {
@@ -154,6 +201,48 @@ manualResourceListEl.addEventListener("blur", (e) => {
 
 /* 初始化：从 storage 恢复配置，若无则至少一行 */
 void loadPopupConfig();
+void loadSinkSettings();
+
+if (useLocalSinkEl) {
+  useLocalSinkEl.addEventListener("change", () => {
+    void saveSinkPreference().then(() => refreshSinkInfoDisplay());
+  });
+}
+
+async function probeLocalServer() {
+  await saveSinkPreference();
+  if (!useLocalSinkEl?.checked) {
+    return { ok: true, message: "已关闭本地服务，将使用 Chrome 下载" };
+  }
+  const data = await refreshSinkInfoDisplay();
+  if (!data?.defaultOutputRoot) {
+    throw new Error("无法获取输出目录，请确认 npm run poki-server 已从仓库根目录启动");
+  }
+  return {
+    ok: true,
+    message: `本地服务正常\n${DEFAULT_SERVER_URL}\n输出: ${data.defaultOutputRoot}`
+  };
+}
+
+if (testSinkBtn) {
+  testSinkBtn.addEventListener("click", async () => {
+    testSinkBtn.disabled = true;
+    testSinkBtn.textContent = "检测中...";
+    try {
+      savePopupConfig();
+      const result = await probeLocalServer();
+      setStatus(result.message || "本地服务正常");
+    } catch (e) {
+      const msg = e?.message || String(e);
+      setError(
+        `本地服务不可用: ${msg}\n\n请执行: npm run poki-server\n服务地址: ${DEFAULT_SERVER_URL}`
+      );
+    } finally {
+      testSinkBtn.disabled = false;
+      testSinkBtn.textContent = "检测本地服务";
+    }
+  });
+}
 
 clearConfigBtn.addEventListener("click", () => {
   manualGameUrlEl.value = "";
@@ -174,20 +263,30 @@ startBtn.addEventListener("click", async () => {
     const manualGameUrl = manualGameUrlEl.value.trim() || null;
     const manualResourceUrls = getManualResourceUrls();
 
+    savePopupConfig();
+    const sinkSettings = getSinkSettings();
+
     const result = await chrome.runtime.sendMessage({
       type: "START_MONITOR",
       tabId: tab.id,
       manualGameUrl,
-      manualResourceUrls
+      manualResourceUrls,
+      sinkSettings
     });
 
     if (!result) throw new Error("后台无响应，请在 chrome://extensions/ 重新加载插件。");
     if (!result.ok) throw new Error(result.error || "开启监听失败。");
 
     const usedManualUrl = !!manualGameUrl && manualGameUrl.startsWith("http");
+    let sinkLine = "\n写盘: Chrome 下载（可能弹窗，建议启用本地服务）";
+    if (result.sinkMode === "local-server") {
+      const health = await refreshSinkInfoDisplay();
+      const root = health?.defaultOutputRoot || "（见 npm run poki-server）";
+      sinkLine = `\n写盘: 本地服务 → ${root}/${result.folder}/`;
+    }
     let statusMsg = usedManualUrl
-      ? `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/\n\n已使用游戏地址，页面将自动刷新，资源会通过 CDP 抓取并保存。`
-      : `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/\n\n请现在刷新页面，进入游戏。\n检测到游戏后资源将自动下载。\n\n若刷新后仍无下载：可填写上方「游戏地址」和「指定下载的静态资源」后重新开始监听。`;
+      ? `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/${sinkLine}\n\n已使用游戏地址，页面将自动刷新，资源会通过 CDP 抓取并保存。`
+      : `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/${sinkLine}\n\n请现在刷新页面，进入游戏。\n检测到游戏后资源将自动下载。\n\n若刷新后仍无下载：可填写上方「游戏地址」和「指定下载的静态资源」后重新开始监听。`;
     if (usedManualUrl) {
       try {
         const port = chrome.runtime.connect({ name: "keepalive" });

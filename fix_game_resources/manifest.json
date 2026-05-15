@@ -11,6 +11,8 @@
     "webRequest"
   ],
   "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
     "http://*/*",
     "https://*/*"
   ],
@@ -19,6 +21,7 @@
     "default_title": "补全 404 资源"
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   }
 }
