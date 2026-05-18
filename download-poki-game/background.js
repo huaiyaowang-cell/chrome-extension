@@ -1,5 +1,6 @@
 import * as localSink from "./local-sink.js";
 import { scrapePokiPortalPage } from "./portal-scraper.js";
+import { scrapePokiGameTiles } from "./portal-tiles-scraper.js";
 import { mergeManifest, hydrateSessionFiles } from "./assets-manifest-lib.js";
 
 const MANIFEST_REL_PATH = "assets-manifest.json";
@@ -70,9 +71,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
-  if (message?.type === "EXPORT_CONFIG") {
+  if (message?.type === "SCAN_MISSING_GAMES") {
     sessionReady
-      .then(() => exportConfig(message.config, message.folder))
+      .then(() => scanMissingGames(message.tabId, message.sinkSettings || {}))
       .then((r) => sendResponse(r))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -1622,26 +1623,70 @@ function isTrackerUrl(url) {
   return TRACKER_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-/** 导出配置为 JSON 并下载到游戏目录（相对于浏览器默认下载目录） */
-async function exportConfig(config, folder) {
-  if (!folder) {
-    const stored = await chrome.storage.local.get("lastGameInfo");
-    folder = stored.lastGameInfo?.folder;
+async function scanMissingGames(tabId, sinkSettings = {}) {
+  if (tabId == null || !Number.isInteger(tabId) || tabId < 1) {
+    throw new Error("无效的标签页");
   }
-  if (!folder) throw new Error("无游戏目录，请先开始监听。");
 
-  const json = JSON.stringify(
-    {
-      gameName: config.gameName,
-      folder: config.folder
-    },
-    null,
-    2
-  );
+  const tab = await chrome.tabs.get(tabId);
+  const pageUrl = tab.url || "";
+  let host = "";
+  try {
+    host = new URL(pageUrl).hostname.replace(/^www\./, "");
+  } catch {
+    throw new Error("无法解析当前页 URL");
+  }
+  if (host !== "poki.com" && !host.endsWith(".poki.com")) {
+    throw new Error("请在 Poki 游戏页（poki.com/.../g/...）使用此功能");
+  }
 
-  const filename = `${folder}/poki-download-config.json`;
-  await downloadText(filename, json, "application/json");
-  return { ok: true, filename };
+  const injected = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: scrapePokiGameTiles
+  });
+  const scraped = injected?.[0]?.result;
+  if (!scraped?.tiles?.length) {
+    throw new Error("未在页面找到推荐游戏列表（请滚动到下方游戏区后重试）");
+  }
+
+  await localSink.loadSettings(sinkSettings);
+  if (!localSink.isEnabled()) {
+    throw new Error("请启用「本地服务写盘」并填写输出根目录");
+  }
+  await localSink.ensureReady(sinkSettings);
+  const health = await localSink.healthCheck();
+  if (!health?.features?.listGameDirs) {
+    throw new Error(
+      "本地服务版本过旧，请停止旧进程后重新执行 npm run poki-server，再点击检查"
+    );
+  }
+  const outputRoot = localSink.getSettings()?.outputRoot || "";
+  const listed = await localSink.listOutputGameDirs(outputRoot);
+  const existing = new Set((listed.dirs || []).map((name) => sanitizeName(name)));
+
+  const missing = [];
+  const downloaded = [];
+  for (const tile of scraped.tiles) {
+    const folder = sanitizeName(tile.slug);
+    const item = { ...tile, folder };
+    if (existing.has(folder)) {
+      downloaded.push(item);
+    } else {
+      missing.push(item);
+    }
+  }
+
+  return {
+    ok: true,
+    outputRoot,
+    pageUrl: scraped.pageUrl,
+    currentSlug: scraped.currentSlug || "",
+    totalOnPage: scraped.tiles.length,
+    downloadedCount: downloaded.length,
+    missingCount: missing.length,
+    missing,
+    downloaded
+  };
 }
 
 function extractExtFromUrl(url) {

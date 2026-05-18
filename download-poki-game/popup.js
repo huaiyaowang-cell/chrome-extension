@@ -2,10 +2,11 @@ const startBtn = document.getElementById("startBtn");
 const captureBtn = document.getElementById("captureBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
-const exportConfigBtn = document.getElementById("exportConfigBtn");
-const importConfigBtn = document.getElementById("importConfigBtn");
-const importFileEl = document.getElementById("importFile");
 const clearConfigBtn = document.getElementById("clearConfigBtn");
+const scanMissingBtn = document.getElementById("scanMissingBtn");
+const missingSummaryEl = document.getElementById("missingSummary");
+const missingGamesGridEl = document.getElementById("missingGamesGrid");
+const missingEmptyEl = document.getElementById("missingEmpty");
 const useLocalSinkEl = document.getElementById("useLocalSink");
 const sinkServerUrlEl = document.getElementById("sinkServerUrl");
 const sinkOutputRootEl = document.getElementById("sinkOutputRoot");
@@ -255,44 +256,73 @@ stopBtn.addEventListener("click", async () => {
   }
 });
 
-exportConfigBtn.addEventListener("click", async () => {
-  try {
-    const tab = await getActiveTab();
-    if (!tab?.id) throw new Error("未找到当前标签页。");
-    const statusResult = await chrome.runtime.sendMessage({
-      type: "GET_MONITOR_STATUS",
-      tabId: tab.id
-    });
-    if (!statusResult?.ok) throw new Error("无法获取状态。");
-    const folder = statusResult.folder;
-    const gameName = statusResult.gameName || "poki-game";
-    if (!folder) throw new Error("无游戏目录信息，请先开始监听一次。");
+function escapeHtml(s) {
+  if (s == null) return "";
+  const div = document.createElement("div");
+  div.textContent = String(s);
+  return div.innerHTML;
+}
 
-    const result = await chrome.runtime.sendMessage({
-      type: "EXPORT_CONFIG",
-      config: { gameName, folder },
-      folder
-    });
-    if (!result?.ok) throw new Error(result?.error || "导出失败。");
-    setStatus(`配置已导出到：${result.filename}`);
-  } catch (e) {
-    setError(`导出失败: ${e.message}`);
+function renderMissingGames(result) {
+  if (!missingSummaryEl || !missingGamesGridEl || !missingEmptyEl) return;
+
+  const missing = result.missing || [];
+  if (missing.length === 0) {
+    missingSummaryEl.style.display = "none";
+    missingGamesGridEl.style.display = "none";
+    missingEmptyEl.style.display = "block";
+    missingEmptyEl.textContent = `推荐区 ${result.totalOnPage || 0} 个游戏均已存在于输出目录。`;
+    return;
   }
-});
 
-importConfigBtn.addEventListener("click", () => importFileEl.click());
+  missingEmptyEl.style.display = "none";
+  missingSummaryEl.style.display = "block";
+  missingSummaryEl.textContent = `共解析 ${result.totalOnPage} 个，未下载 ${missing.length} 个（输出: ${result.outputRoot}）`;
 
-importFileEl.addEventListener("change", async (e) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
-  e.target.value = "";
-  try {
-    const config = JSON.parse(await file.text());
-    setStatus(`已导入配置，游戏: ${config.gameName || "-"}，目录: ${config.folder || "-"}`);
-  } catch (err) {
-    setError(`导入失败: ${err.message}`);
-  }
-});
+  missingGamesGridEl.style.display = "grid";
+  missingGamesGridEl.innerHTML = missing
+    .map((game) => {
+      const title = escapeHtml(game.title || game.slug);
+      const icon = game.iconUrl
+        ? `<img src="${escapeHtml(game.iconUrl)}" alt="${title}" loading="lazy" />`
+        : `<div style="width:56px;height:56px;border-radius:10px;background:#e5e7eb"></div>`;
+      return `<a class="missing-game-card" href="${escapeHtml(game.portalUrl)}" target="_blank" rel="noopener" title="${title}\n${escapeHtml(game.folder)}">${icon}<span>${title}</span></a>`;
+    })
+    .join("");
+}
+
+if (scanMissingBtn) {
+  scanMissingBtn.addEventListener("click", async () => {
+    scanMissingBtn.disabled = true;
+    scanMissingBtn.textContent = "检查中...";
+    if (missingGamesGridEl) missingGamesGridEl.style.display = "none";
+    if (missingEmptyEl) missingEmptyEl.style.display = "none";
+    if (missingSummaryEl) missingSummaryEl.style.display = "none";
+
+    try {
+      const tab = await getActiveTab();
+      if (!tab?.id) throw new Error("未找到当前标签页。");
+
+      await saveSinkSettings();
+      const result = await chrome.runtime.sendMessage({
+        type: "SCAN_MISSING_GAMES",
+        tabId: tab.id,
+        sinkSettings: getSinkSettings()
+      });
+
+      if (!result?.ok) throw new Error(result.error || "检查失败");
+      renderMissingGames(result);
+      setStatus(
+        `未下载 ${result.missingCount} / ${result.totalOnPage} 个\n点击头像可在新标签打开游戏页，再「开始监听」抓取。`
+      );
+    } catch (e) {
+      setError(`检查失败: ${e.message}`);
+    } finally {
+      scanMissingBtn.disabled = false;
+      scanMissingBtn.textContent = "检查未下载游戏";
+    }
+  });
+}
 
 void loadSinkSettings();
 void refreshStatus();

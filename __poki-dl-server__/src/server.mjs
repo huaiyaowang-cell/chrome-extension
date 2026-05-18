@@ -369,13 +369,32 @@ async function handleRequest(req, res) {
     if (method === "GET" && url.pathname === "/health") {
       return json(res, 200, {
         ok: true,
-        version: "1.0.0",
+        version: "1.1.0",
         port: PORT,
         defaultOutputRoot: DEFAULT_OUTPUT_ROOT,
         sessions: sessions.size,
         queue: jobQueue.length,
-        activeDownloads
+        activeDownloads,
+        features: { listGameDirs: true }
       });
+    }
+
+    if (method === "POST" && url.pathname === "/api/output/list-game-dirs") {
+      const body = await readJson(req);
+      const outputRoot = path.resolve(
+        String(body.outputRoot || DEFAULT_OUTPUT_ROOT).trim()
+      );
+      let dirs = [];
+      try {
+        const entries = await fs.readdir(outputRoot, { withFileTypes: true });
+        dirs = entries
+          .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+          .map((e) => e.name)
+          .sort((a, b) => a.localeCompare(b));
+      } catch (e) {
+        if (e.code !== "ENOENT") throw e;
+      }
+      return json(res, 200, { ok: true, outputRoot, dirs });
     }
 
     if (method === "POST" && url.pathname === "/api/session/start") {
