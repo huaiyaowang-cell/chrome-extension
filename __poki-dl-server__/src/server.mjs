@@ -10,6 +10,7 @@ import path from "node:path";
 import { createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { randomBytes } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 const PORT = Number(process.env.POKI_DL_PORT || 22222);
 const HOST = "127.0.0.1";
@@ -127,6 +128,72 @@ function safeResolve(gameDir, relPath) {
     throw new Error("path escape");
   }
   return { abs, relPath: normalized };
+}
+
+const LOCAL_ICON_CANDIDATES = [
+  "icon.webp",
+  "icon.png",
+  "og-image.webp",
+  "preview.webp",
+  "preview.mp4"
+];
+
+async function readGameLibraryEntry(gameDir, folder) {
+  /** @type {{ folder: string, title: string, iconUrl: string, openUrl: string }} */
+  const entry = {
+    folder,
+    title: folder,
+    iconUrl: "",
+    openUrl: ""
+  };
+
+  try {
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(gameDir, "assets-manifest.json"), "utf8")
+    );
+    if (manifest.gameName) entry.title = String(manifest.gameName);
+    if (manifest.pageUrl) {
+      entry.openUrl = String(manifest.pageUrl).split("#")[0];
+    }
+  } catch {
+    /* no manifest */
+  }
+
+  try {
+    const portalMeta = JSON.parse(
+      await fs.readFile(path.join(gameDir, "__info_assets__", "meta.json"), "utf8")
+    );
+    if (portalMeta.title) entry.title = String(portalMeta.title);
+    const media = portalMeta.media || {};
+    const remoteIcon = media.ogImageUrl || media.iconUrl;
+    if (remoteIcon) entry.iconUrl = String(remoteIcon);
+    if (portalMeta.portalUrl && !entry.openUrl) {
+      entry.openUrl = String(portalMeta.portalUrl).split("#")[0];
+    }
+  } catch {
+    /* no portal meta */
+  }
+
+  if (!entry.iconUrl) {
+    const infoDir = path.join(gameDir, "__info_assets__");
+    for (const name of LOCAL_ICON_CANDIDATES) {
+      if (name.endsWith(".mp4")) continue;
+      const abs = path.join(infoDir, name);
+      if (await fileExists(abs)) {
+        entry.iconUrl = pathToFileURL(abs).href;
+        break;
+      }
+    }
+  }
+
+  if (!entry.openUrl) {
+    const indexPath = path.join(gameDir, "index.html");
+    if (await fileExists(indexPath)) {
+      entry.openUrl = pathToFileURL(indexPath).href;
+    }
+  }
+
+  return entry;
 }
 
 async function fileExists(absPath) {
@@ -375,7 +442,7 @@ async function handleRequest(req, res) {
         sessions: sessions.size,
         queue: jobQueue.length,
         activeDownloads,
-        features: { listGameDirs: true }
+        features: { listGameDirs: true, listGames: true }
       });
     }
 
@@ -395,6 +462,33 @@ async function handleRequest(req, res) {
         if (e.code !== "ENOENT") throw e;
       }
       return json(res, 200, { ok: true, outputRoot, dirs });
+    }
+
+    if (method === "POST" && url.pathname === "/api/output/list-games") {
+      const body = await readJson(req);
+      const outputRoot = path.resolve(
+        String(body.outputRoot || DEFAULT_OUTPUT_ROOT).trim()
+      );
+      let dirs = [];
+      try {
+        const entries = await fs.readdir(outputRoot, { withFileTypes: true });
+        dirs = entries
+          .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+          .map((e) => e.name)
+          .sort((a, b) => a.localeCompare(b));
+      } catch (e) {
+        if (e.code !== "ENOENT") throw e;
+      }
+      const games = [];
+      for (const name of dirs) {
+        games.push(await readGameLibraryEntry(path.join(outputRoot, name), name));
+      }
+      games.sort((a, b) =>
+        (a.title || a.folder).localeCompare(b.title || b.folder, undefined, {
+          sensitivity: "base"
+        })
+      );
+      return json(res, 200, { ok: true, outputRoot, count: games.length, games });
     }
 
     if (method === "POST" && url.pathname === "/api/session/start") {

@@ -935,6 +935,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "LIST_LOCAL_GAMES") {
+    (async () => {
+      try {
+        await localSink.loadSettings(message.sinkSettings || {});
+        if (!(await localSink.isLocalSinkRequested())) {
+          sendResponse({
+            ok: false,
+            error: "请先启用本地服务并填写输出根目录"
+          });
+          return;
+        }
+        await localSink.ensureLocalSinkReady(message.sinkSettings || {});
+        const r = await localSink.listLocalGames(
+          message.sinkSettings?.outputRoot
+        );
+        sendResponse({ ok: true, ...r });
+      } catch (e) {
+        sendResponse({ ok: false, error: (e && e.message) || String(e) });
+      }
+    })();
+    return true;
+  }
+
   if (message?.type === "CHECK_SINK_HEALTH") {
     (async () => {
       try {

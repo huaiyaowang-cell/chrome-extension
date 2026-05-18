@@ -108,7 +108,20 @@ async function api(path, options = {}) {
     data = null;
   }
   if (!res.ok) {
-    throw new Error(data?.error || `本地服务 HTTP ${res.status}`);
+    const pathHint = options._apiPath || path;
+    if (res.status === 404) {
+      if (pathHint === "/api/output/list-game-dirs") {
+        throw new Error(
+          "本地服务缺少「列出游戏目录」接口，请重启 poki-dl-server（npm run poki-server）后再试"
+        );
+      }
+      if (pathHint === "/api/output/list-games") {
+        throw new Error(
+          "本地服务缺少「列出本地游戏」接口，请重启 poki-dl-server（npm run poki-server）后再试"
+        );
+      }
+    }
+    throw new Error(data?.error || `本地服务 HTTP ${res.status} (${pathHint})`);
   }
   return data;
 }
@@ -117,6 +130,20 @@ export async function healthCheck() {
   const data = await api("/health");
   if (!data?.ok) throw new Error("本地服务未就绪");
   return data;
+}
+
+/** 列出输出根目录下的游戏及标题、头像、打开地址 */
+export async function listLocalGames(outputRoot) {
+  await loadSettings();
+  const root = String(outputRoot || settings?.outputRoot || "").trim();
+  if (!root) {
+    throw new Error("请填写「输出根目录」");
+  }
+  return api("/api/output/list-games", {
+    method: "POST",
+    body: { outputRoot: root },
+    _apiPath: "/api/output/list-games"
+  });
 }
 
 export async function pingServer(overrides = {}) {

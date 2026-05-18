@@ -16,6 +16,10 @@ const sinkServerUrlEl = document.getElementById("sinkServerUrl");
 const sinkOutputRootEl = document.getElementById("sinkOutputRoot");
 const testSinkBtn = document.getElementById("testSinkBtn");
 const importManifestBtn = document.getElementById("importManifestBtn");
+const loadLocalGamesBtn = document.getElementById("loadLocalGamesBtn");
+const localGamesSummaryEl = document.getElementById("localGamesSummary");
+const localGamesGridEl = document.getElementById("localGamesGrid");
+const localGamesEmptyEl = document.getElementById("localGamesEmpty");
 
 const SINK_SETTINGS_KEY = "pokiSinkSettings";
 const STORAGE_SETTINGS = "fixGameResources_settings";
@@ -25,6 +29,9 @@ const LEGACY_DOWNLOAD_DIR = "downloaded-games";
 let currentTabId = null;
 let current404List = [];
 let isListening = false;
+/** @type {{ origin: string, pathPrefix: string }} */
+let previewContext = { origin: "", pathPrefix: "/" };
+let lastLocalGamesOutputRoot = "";
 
 function showStatus(text, type) {
   statusEl.textContent = text;
@@ -34,6 +41,75 @@ function showStatus(text, type) {
 
 function hideStatus() {
   statusEl.style.display = "none";
+}
+
+async function capturePreviewContext() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.url?.startsWith("http")) {
+      const u = new URL(tab.url);
+      previewContext = {
+        origin: u.origin,
+        pathPrefix: u.pathname || "/"
+      };
+      return previewContext;
+    }
+  } catch {
+    /* ignore */
+  }
+  previewContext = { origin: "", pathPrefix: "/" };
+  return previewContext;
+}
+
+/**
+ * 根据当前预览页 origin + 输出根目录名，拼本地 http 游戏地址。
+ * 例：服务在 downloaded-games 根目录 → /games-test/foo/
+ *     服务在 games-test 目录内 → /foo/
+ */
+function buildLocalPreviewUrl(outputRoot, folder) {
+  const origin = (previewContext.origin || "").replace(/\/$/, "");
+  const folderName = String(folder || "").trim();
+  if (!origin || !folderName) return "";
+
+  const rootName =
+    String(outputRoot || "")
+      .replace(/\\/g, "/")
+      .replace(/\/$/, "")
+      .split("/")
+      .filter(Boolean)
+      .pop() || "";
+
+  const pathPrefix = previewContext.pathPrefix || "/";
+  let urlPath = folderName;
+  if (
+    rootName &&
+    (pathPrefix === `/${rootName}` ||
+      pathPrefix.startsWith(`/${rootName}/`) ||
+      pathPrefix.includes(`/${rootName}/`))
+  ) {
+    urlPath = `${rootName}/${folderName}`;
+  }
+
+  const segments = urlPath.split("/").filter(Boolean).map(encodeURIComponent);
+  return `${origin}/${segments.join("/")}/`;
+}
+
+async function openLocalGameInCurrentTab(outputRoot, folder) {
+  await capturePreviewContext();
+  const url = buildLocalPreviewUrl(outputRoot, folder);
+  if (!url) {
+    showStatus("无法构建本地预览地址，请先在浏览器打开本地 http 服务页面", "error");
+    setTimeout(hideStatus, 3000);
+    return;
+  }
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) {
+    showStatus("未找到当前标签页", "error");
+    setTimeout(hideStatus, 2500);
+    return;
+  }
+  await chrome.tabs.update(tab.id, { url });
 }
 
 function normalizeGameDomainUrl(input) {
@@ -431,6 +507,96 @@ if (importManifestBtn) {
   importManifestBtn.addEventListener("click", () => void importFromManifest());
 }
 
+function renderLocalGames(result) {
+  const games = result?.games || [];
+  if (!localGamesGridEl || !localGamesEmptyEl) return;
+  lastLocalGamesOutputRoot = result?.outputRoot || "";
+
+  if (games.length === 0) {
+    if (localGamesSummaryEl) localGamesSummaryEl.style.display = "none";
+    localGamesGridEl.style.display = "none";
+    localGamesGridEl.innerHTML = "";
+    localGamesEmptyEl.style.display = "block";
+    localGamesEmptyEl.textContent = `输出目录暂无游戏文件夹（${result?.outputRoot || ""}）`;
+    return;
+  }
+
+  if (localGamesSummaryEl) {
+    localGamesSummaryEl.style.display = "block";
+    localGamesSummaryEl.textContent = `共 ${games.length} 个游戏（${result.outputRoot || ""}）`;
+  }
+  localGamesEmptyEl.style.display = "none";
+  localGamesGridEl.style.display = "grid";
+  localGamesGridEl.innerHTML = games
+    .map((game) => {
+      const title = escapeHtml(game.title || game.folder);
+      const folder = escapeHtml(game.folder || "");
+      const icon = game.iconUrl
+        ? `<img src="${escapeHtml(game.iconUrl)}" alt="${title}" loading="lazy" />`
+        : `<div style="width:56px;height:56px;border-radius:10px;background:#e5e7eb"></div>`;
+      return `<button type="button" class="local-game-card" data-folder="${folder}" title="${title}\n${escapeHtml(game.folder)}">${icon}<span>${title}</span></button>`;
+    })
+    .join("");
+
+  localGamesGridEl.querySelectorAll(".local-game-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      const folder = card.getAttribute("data-folder");
+      if (!folder) return;
+      void openLocalGameInCurrentTab(lastLocalGamesOutputRoot, folder);
+    });
+  });
+}
+
+async function loadLocalGames(options = {}) {
+  const silent = !!options.silent;
+  if (loadLocalGamesBtn) {
+    loadLocalGamesBtn.disabled = true;
+    loadLocalGamesBtn.textContent = "读取中...";
+  }
+  if (localGamesGridEl) localGamesGridEl.style.display = "none";
+  if (localGamesSummaryEl) localGamesSummaryEl.style.display = "none";
+
+  try {
+    await capturePreviewContext();
+    await saveSinkSettings();
+    const sink = getSinkSettings();
+    if (!sink.enabled) {
+      throw new Error("请先启用本地服务");
+    }
+    if (!sink.outputRoot) {
+      throw new Error("请填写输出根目录");
+    }
+
+    const result = await chrome.runtime.sendMessage({
+      type: "LIST_LOCAL_GAMES",
+      sinkSettings: sink
+    });
+    if (!result?.ok) throw new Error(result.error || "读取失败");
+    renderLocalGames(result);
+    if (!silent) {
+      showStatus(`已读取 ${result.count ?? result.games?.length ?? 0} 个本地游戏`, "ok");
+      setTimeout(hideStatus, 2500);
+    }
+  } catch (e) {
+    if (localGamesEmptyEl) {
+      localGamesEmptyEl.style.display = "block";
+      localGamesEmptyEl.textContent = e?.message || String(e);
+    }
+    if (!silent) {
+      showStatus(`读取本地游戏失败: ${e?.message || e}`, "error");
+    }
+  } finally {
+    if (loadLocalGamesBtn) {
+      loadLocalGamesBtn.disabled = false;
+      loadLocalGamesBtn.textContent = "读取本地游戏";
+    }
+  }
+}
+
+if (loadLocalGamesBtn) {
+  loadLocalGamesBtn.addEventListener("click", () => void loadLocalGames());
+}
+
 if (useLocalSinkEl) useLocalSinkEl.addEventListener("change", () => void saveSinkSettings());
 if (sinkServerUrlEl) sinkServerUrlEl.addEventListener("blur", () => void saveSinkSettings());
 if (sinkOutputRootEl) sinkOutputRootEl.addEventListener("blur", () => void saveSinkSettings());
@@ -459,4 +625,7 @@ void (async () => {
   await suggestFromTab();
   await loadListenStatus();
   await load404List();
+  if (useLocalSinkEl?.checked && (sinkOutputRootEl?.value || "").trim()) {
+    void loadLocalGames({ silent: true });
+  }
 })();
