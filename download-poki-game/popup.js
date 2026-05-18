@@ -15,6 +15,9 @@ const testSinkBtn = document.getElementById("testSinkBtn");
 const SINK_SETTINGS_KEY = "pokiSinkSettings";
 const DEFAULT_SERVER_URL = "http://127.0.0.1:22222";
 
+/** 执行「检查未下载游戏」时的 Poki 标签页，用于点击头像在当前页跳转 */
+let missingGamesTabId = null;
+
 function setStatus(text) {
   statusEl.textContent = text;
   statusEl.classList.remove("error");
@@ -263,8 +266,9 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
-function renderMissingGames(result) {
+function renderMissingGames(result, tabId) {
   if (!missingSummaryEl || !missingGamesGridEl || !missingEmptyEl) return;
+  if (tabId != null) missingGamesTabId = tabId;
 
   const missing = result.missing || [];
   if (missing.length === 0) {
@@ -286,9 +290,25 @@ function renderMissingGames(result) {
       const icon = game.iconUrl
         ? `<img src="${escapeHtml(game.iconUrl)}" alt="${title}" loading="lazy" />`
         : `<div style="width:56px;height:56px;border-radius:10px;background:#e5e7eb"></div>`;
-      return `<a class="missing-game-card" href="${escapeHtml(game.portalUrl)}" target="_blank" rel="noopener" title="${title}\n${escapeHtml(game.folder)}">${icon}<span>${title}</span></a>`;
+      const portalUrl = game.portalUrl || "";
+      return `<button type="button" class="missing-game-card" data-portal-url="${escapeHtml(portalUrl)}" title="${title}\n${escapeHtml(game.folder || game.slug || "")}">${icon}<span>${title}</span></button>`;
     })
     .join("");
+
+  missingGamesGridEl.querySelectorAll(".missing-game-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      const url = card.getAttribute("data-portal-url");
+      if (!url) {
+        setError("该游戏没有可跳转的 Poki 地址");
+        return;
+      }
+      if (missingGamesTabId == null) {
+        setError("未找到用于跳转的标签页，请重新执行「检查未下载游戏」");
+        return;
+      }
+      void chrome.tabs.update(missingGamesTabId, { url }).then(() => window.close());
+    });
+  });
 }
 
 if (scanMissingBtn) {
@@ -311,9 +331,9 @@ if (scanMissingBtn) {
       });
 
       if (!result?.ok) throw new Error(result.error || "检查失败");
-      renderMissingGames(result);
+      renderMissingGames(result, tab.id);
       setStatus(
-        `未下载 ${result.missingCount} / ${result.totalOnPage} 个\n点击头像可在新标签打开游戏页，再「开始监听」抓取。`
+        `未下载 ${result.missingCount} / ${result.totalOnPage} 个\n点击头像在当前页跳转到游戏，再「开始监听」抓取。`
       );
     } catch (e) {
       setError(`检查失败: ${e.message}`);

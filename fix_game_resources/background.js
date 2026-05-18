@@ -30,6 +30,8 @@ let lastSyncedGameSlug = "";
 
 /** 串行化 404 下载，避免并发 startSession / flush 竞态 */
 let downloadQueue = Promise.resolve();
+/** 当前正在执行的 404 下载任务数（用于避免在任务内 await downloadQueue 死锁） */
+let downloadJobsInFlight = 0;
 
 /** 串行化 manifest 同步（与 404 下载队列配合，避免竞态） */
 let settingsSyncChain = Promise.resolve();
@@ -47,8 +49,9 @@ function normalize404Rel(encodedRel) {
   }
 }
 
-function make404DownloadKey(pageUrl, encodedRel, gameName = "") {
+function make404DownloadKey(pageUrl, encodedRel, gameName = "", relPrefix = "") {
   const slug =
+    (relPrefix || "").trim() ||
     sanitizeName(gameName) ||
     sanitizeName(parseGameNameFromUrl(pageUrl)) ||
     "unknown";
@@ -60,9 +63,26 @@ function clearInflight404Keys() {
 }
 
 function enqueueDownloadJob(fn) {
-  const job = downloadQueue.then(() => fn());
+  const job = downloadQueue.then(async () => {
+    downloadJobsInFlight += 1;
+    try {
+      return await fn();
+    } finally {
+      downloadJobsInFlight -= 1;
+    }
+  });
   downloadQueue = job.catch(() => {});
   return job;
+}
+
+/** 等待其它 404 下载结束；若当前就在下载任务内则跳过，避免死锁 */
+async function waitForPendingDownloads() {
+  if (downloadJobsInFlight <= 1) return;
+  try {
+    await downloadQueue;
+  } catch {
+    /* 队列中某项失败不影响后续会话重置 */
+  }
 }
 
 function enqueueSettingsSync(fn) {
@@ -175,18 +195,129 @@ async function getSettings() {
   const s = raw[STORAGE_SETTINGS] || {};
   return {
     domain: s.domain || "",
-    gameName: s.gameName || ""
+    gameName: s.gameName || "",
+    relPrefix: s.relPrefix || ""
   };
 }
 
 async function saveSettingsToStorage(settings) {
   const domain = gameUrlToCdnRoot(settings.domain) || normalizeGameDomainUrl(settings.domain);
+  const gameName = String(settings.gameName || "").trim();
+  const relPrefix = String(settings.relPrefix || "").trim() || gameName;
   const next = {
     domain,
-    gameName: String(settings.gameName || "").trim()
+    gameName,
+    relPrefix
   };
   await chrome.storage.local.set({ [STORAGE_SETTINGS]: next });
   return next;
+}
+
+function sanitizeName(input) {
+  return String(input)
+    .trim()
+    .replace(/[/\\?%*:|"<>]/g, "_")
+    .replace(/\s+/g, "_")
+    .slice(0, 120);
+}
+
+function isPokiPortalUrl(pageUrl) {
+  try {
+    const host = new URL(pageUrl).hostname.replace(/^www\./, "");
+    return host === "poki.com" || host.endsWith(".poki.com");
+  } catch {
+    return false;
+  }
+}
+
+/** 本地静态服游戏页（localhost / 127.0.0.1 / 局域网 IP） */
+function isLocalGamePageUrl(pageUrl) {
+  if (!pageUrl) return false;
+  try {
+    const u = new URL(pageUrl);
+    if (u.protocol === "file:") return true;
+    if (isPokiPortalUrl(pageUrl)) return false;
+    const host = u.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") return true;
+    if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)\d+\.\d+/.test(host)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Poki 门户路径误当作本地目录，如 en/g/cricket-world-cup */
+function isPortalRelPrefix(relPrefix) {
+  const p = String(relPrefix || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!p) return false;
+  if (/\/g\/[^/]+/i.test(`/${p}/`)) return true;
+  if (/^[a-z]{2}\/g\//i.test(p)) return true;
+  return false;
+}
+
+function normalizeRelPrefix(relPrefix) {
+  return String(relPrefix || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+/** 输出根目录下的游戏相对路径（仅从本地游戏页 URL 解析） */
+function parseGameRelPrefixFromPageUrl(pageUrl) {
+  if (!isLocalGamePageUrl(pageUrl)) return "";
+  try {
+    let segments = new URL(pageUrl).pathname.split("/").filter(Boolean);
+    if (segments.length === 0) return "";
+    if (/\.html?$/i.test(segments[segments.length - 1])) {
+      segments = segments.slice(0, -1);
+    }
+    if (segments[0] === LEGACY_DOWNLOAD_DIR && segments.length > 1) {
+      segments = segments.slice(1);
+    }
+    const prefix = segments.join("/");
+    return isPortalRelPrefix(prefix) ? "" : prefix;
+  } catch {
+    return "";
+  }
+}
+
+function resolveRelPrefix(settings, pageUrl) {
+  const fromSettings = normalizeRelPrefix(settings?.relPrefix);
+  if (fromSettings && !isPortalRelPrefix(fromSettings)) return fromSettings;
+  const fromPage = parseGameRelPrefixFromPageUrl(pageUrl);
+  if (fromPage) return fromPage;
+  const slug = parseGameNameFromUrl(pageUrl);
+  return slug ? sanitizeName(slug) : "";
+}
+
+function resolveRelPrefixFromManifest(manifest, localPageUrl) {
+  const folder = normalizeRelPrefix(manifest?.folder);
+  if (folder && !isPortalRelPrefix(folder)) return folder;
+
+  const localPrefix = parseGameRelPrefixFromPageUrl(localPageUrl);
+  if (localPrefix) return localPrefix;
+
+  if (manifest?.pageUrl && isLocalGamePageUrl(manifest.pageUrl)) {
+    const fromManifestPage = parseGameRelPrefixFromPageUrl(manifest.pageUrl);
+    if (fromManifestPage) return fromManifestPage;
+  }
+
+  return "";
+}
+
+function gameSlugMatchesManifest(slugFromUrl, manifestGame, relPrefix) {
+  if (!slugFromUrl || !manifestGame) return true;
+  const slugNorm = sanitizeName(slugFromUrl).toLowerCase();
+  const manifestNorm = sanitizeName(manifestGame).toLowerCase();
+  if (slugNorm === manifestNorm) return true;
+  const relTail = (relPrefix || "").split("/").filter(Boolean).pop() || "";
+  if (relTail && sanitizeName(relTail).toLowerCase() === slugNorm) return true;
+  // manifest.gameName 可能是展示标题（含空格），不与 URL slug 做严格相等
+  if (!/^[a-z0-9][a-z0-9_-]*$/i.test(String(manifestGame).trim())) return true;
+  return false;
 }
 
 /** 从 manifest.gameUrl 得到无 query/hash 的 CDN 根地址 */
@@ -232,6 +363,7 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
   }
   let domain = "";
   let gameName = gameNameFromUrl;
+  let relPrefix = parseGameRelPrefixFromPageUrl(pageUrl);
 
   try {
     const manifest = await fetchManifestForPage(pageUrl);
@@ -248,6 +380,8 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
     if (manifest.gameName) {
       gameName = String(manifest.gameName).trim();
     }
+    const fromManifest = resolveRelPrefixFromManifest(manifest, pageUrl);
+    if (fromManifest) relPrefix = fromManifest;
   } catch (e) {
     console.warn("[fix_game_resources] 读取 manifest 失败:", e.message);
     return {
@@ -267,19 +401,23 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
 
   const next = {
     domain,
-    gameName: gameName || prev.gameName || gameNameFromUrl
+    gameName: gameName || prev.gameName || gameNameFromUrl,
+    relPrefix:
+      relPrefix ||
+      prev.relPrefix ||
+      gameNameFromUrl ||
+      parseGameRelPrefixFromPageUrl(pageUrl)
   };
 
-  const valuesChanged = next.domain !== prev.domain || next.gameName !== prev.gameName;
+  const valuesChanged =
+    next.domain !== prev.domain ||
+    next.gameName !== prev.gameName ||
+    next.relPrefix !== prev.relPrefix;
 
   if (valuesChanged || force) {
     await saveSettingsToStorage(next);
     if (valuesChanged) {
-      try {
-        await downloadQueue;
-      } catch {
-        /* 队列中某项失败不影响重置会话 */
-      }
+      await waitForPendingDownloads();
       if (await localSink.isLocalSinkRequested()) {
         try {
           await localSink.flushQueue();
@@ -330,11 +468,7 @@ async function runSyncFromTab(tabId, pageUrl, options = {}) {
     const gameChanged = !!gameSlug && gameSlug !== lastSyncedGameSlug;
 
     if (gameChanged) {
-      try {
-        await downloadQueue;
-      } catch {
-        /* 上一游戏遗留下载失败不阻塞切换 */
-      }
+      await waitForPendingDownloads();
       clearInflight404Keys();
       await reset404ListForTab(tabId, pageUrl);
       console.log("[fix_game_resources] 已切换游戏，404 列表已清空:", gameSlug);
@@ -439,27 +573,32 @@ function relPathForFile(encodedRel) {
 
 function buildRemoteAndLocal(settings, pageUrl, encodedRel) {
   const domain = normalizeGameDomainUrl(settings.domain).replace(/\/+$/, "");
+  const relPrefix = resolveRelPrefix(settings, pageUrl);
   let gameName = (settings.gameName || "").trim();
   if (!gameName) gameName = parseGameNameFromUrl(pageUrl);
   const rel = (encodedRel || "").replace(/^\//, "");
-  if (!domain || !gameName || !rel) {
-    throw new Error("缺少游戏域名、游戏名或相对路径");
+  if (!domain || !relPrefix || !rel) {
+    throw new Error("缺少游戏域名、游戏目录或相对路径");
   }
   const sourceUrl = `${domain}/${rel}`;
   const relForFile = relPathForFile(rel);
-  const relPrefix = gameName;
   return { sourceUrl, relPath: relForFile, relPrefix, gameName, domain };
 }
 
 function buildFixSessionOpts(settings, pageUrl) {
+  const relPrefix = resolveRelPrefix(settings, pageUrl);
   let gameName = (settings.gameName || "").trim();
   if (!gameName) gameName = parseGameNameFromUrl(pageUrl);
+  if (!relPrefix) {
+    throw new Error("无法确定游戏目录（请确认在游戏目录页或 manifest 中有 pageUrl）");
+  }
   if (!gameName) {
-    throw new Error("无法确定游戏名（请确认在游戏目录页或 manifest 中有 gameName）");
+    const tail = relPrefix.split("/").filter(Boolean).pop();
+    gameName = tail || relPrefix;
   }
   return {
-    gameName,
-    relPrefix: gameName,
+    gameName: sanitizeName(gameName),
+    relPrefix,
     pageUrl,
     referer: normalizeGameDomainUrl(settings.domain),
     gameUrl: settings.domain
@@ -491,7 +630,13 @@ async function ensureFixSession(settings, pageUrl) {
 
   if (!localSink.getSessionId()) {
     const started = await localSink.startSession(sessionOpts);
-    activeFixSession = { relPrefix, gameName, domain: settings.domain, pageUrl, pageKey };
+    activeFixSession = {
+      relPrefix,
+      gameName,
+      domain: domainNorm,
+      pageUrl,
+      pageKey
+    };
     console.log("[fix_game_resources] 本地会话:", started.sessionId, started.gameDir);
   }
 
@@ -529,7 +674,8 @@ async function ensureSettingsForPage(pageUrl) {
       };
     }
     const manifestGame = (settings.gameName || "").trim();
-    if (slugFromUrl && manifestGame && slugFromUrl !== manifestGame) {
+    const relPrefix = resolveRelPrefix(settings, pageUrl);
+    if (!gameSlugMatchesManifest(slugFromUrl, manifestGame, relPrefix)) {
       return {
         settings,
         error: `manifest 游戏名 (${manifestGame}) 与当前页 (${slugFromUrl}) 不一致`,
@@ -550,8 +696,8 @@ async function readManifestForMerge(pageUrl) {
 
 async function saveManifestMerged(settings, pageUrl, merged) {
   const json = JSON.stringify(merged, null, 2);
-  const gameName = (settings.gameName || "").trim();
-  if (!gameName) return;
+  const relPrefix = resolveRelPrefix(settings, pageUrl);
+  if (!relPrefix) return;
 
   const sessionOpts = await ensureFixSession(settings, pageUrl);
   if (sessionOpts) {
@@ -564,7 +710,7 @@ async function saveManifestMerged(settings, pageUrl, merged) {
     return;
   }
 
-  const filename = `${gameName}/${MANIFEST_REL_PATH}`;
+  const filename = `${relPrefix}/${MANIFEST_REL_PATH}`;
   const bytes = new TextEncoder().encode(json);
   let binary = "";
   const chunk = 8192;
@@ -696,7 +842,13 @@ async function fetchAndSaveChrome(sourceUrl, filename) {
 }
 
 async function autoDownloadOne(tabId, pageUrl, entry) {
-  const key = make404DownloadKey(pageUrl, entry.relativePath);
+  const settings = await getSettings();
+  const key = make404DownloadKey(
+    pageUrl,
+    entry.relativePath,
+    settings.gameName,
+    resolveRelPrefix(settings, pageUrl)
+  );
   const existing = inflight404ByKey.get(key);
   if (existing) {
     return existing;
