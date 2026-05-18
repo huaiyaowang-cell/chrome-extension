@@ -4,6 +4,9 @@
  */
 
 import * as localSink from "./local-sink.js";
+import { mergeManifest } from "./assets-manifest-lib.js";
+
+const MANIFEST_REL_PATH = "assets-manifest.json";
 
 const STORAGE_404 = "fixGameResources_404";
 const STORAGE_SETTINGS = "fixGameResources_settings";
@@ -335,6 +338,63 @@ async function ensureFixSession(settings, pageUrl) {
   }
 }
 
+async function readManifestForMerge(pageUrl) {
+  try {
+    return await fetchManifestForPage(pageUrl);
+  } catch {
+    return null;
+  }
+}
+
+async function saveManifestMerged(settings, pageUrl, merged) {
+  const json = JSON.stringify(merged, null, 2);
+  const gameName = (settings.gameName || "").trim();
+  if (!gameName) return;
+
+  if (localSink.isEnabled()) {
+    await localSink.loadSettings();
+    await ensureFixSession(settings, pageUrl);
+    await localSink.saveText(MANIFEST_REL_PATH, json, { overwrite: true });
+    return;
+  }
+
+  const filename = `${gameName}/${MANIFEST_REL_PATH}`;
+  const bytes = new TextEncoder().encode(json);
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+    binary += String.fromCharCode.apply(null, slice);
+  }
+  const dataUrl = "data:application/json;charset=utf-8;base64," + btoa(binary);
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      { url: dataUrl, filename, conflictAction: "overwrite", saveAs: false },
+      (downloadId) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(downloadId);
+      }
+    );
+  });
+}
+
+/** 将补全资源合并写入 assets-manifest.json（不覆盖已有条目） */
+async function appendToAssetsManifest(settings, pageUrl, fileEntry) {
+  const gameName = (settings.gameName || "").trim();
+  const domain = (settings.domain || "").trim();
+  if (!gameName || !domain) return;
+
+  const existing = await readManifestForMerge(pageUrl);
+  const merged = mergeManifest(existing, {
+    gameName,
+    gameUrl: domain,
+    pageUrl,
+    status: "fixing",
+    files: [fileEntry]
+  });
+  await saveManifestMerged(settings, pageUrl, merged);
+}
+
 /**
  * 保存单个 404 资源（本地服务或 chrome.downloads 回退）
  */
@@ -353,11 +413,36 @@ async function saveOneResource(settings, pageUrl, encodedRel) {
     if (result?.status === "failed") {
       throw new Error(result.error || "ingest failed");
     }
+    try {
+      await appendToAssetsManifest(settings, pageUrl, {
+        type: "asset",
+        sourceUrl,
+        localPath: relPath,
+        status: "ok",
+        requestType: "404-fix",
+        fixedAt: new Date().toISOString(),
+        skipped: result?.status === "skipped"
+      });
+    } catch (e) {
+      console.warn("[fix_game_resources] 写入 manifest:", e.message);
+    }
     return { sourceUrl, relativePath: encodedRel, relPath, status: result?.status || "ok" };
   }
 
   const filename = `${relPrefix}/${relPath}`;
   await fetchAndSaveChrome(sourceUrl, filename);
+  try {
+    await appendToAssetsManifest(settings, pageUrl, {
+      type: "asset",
+      sourceUrl,
+      localPath: relPath,
+      status: "ok",
+      requestType: "404-fix",
+      fixedAt: new Date().toISOString()
+    });
+  } catch (e) {
+    console.warn("[fix_game_resources] 写入 manifest:", e.message);
+  }
   return { sourceUrl, relativePath: encodedRel, filename, status: "ok" };
 }
 

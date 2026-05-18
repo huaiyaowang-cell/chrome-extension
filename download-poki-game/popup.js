@@ -67,6 +67,7 @@ function renderStatus(result) {
     `总请求: ${s.totalSeen || 0}`,
     `文件数: ${result.fileCount || 0}`,
     `HTML: ${htmlLine}`,
+    `页面信息: ${result.portalInfoSaved ? "__info_assets__ ✓" : "抓取中…"}`,
     `网络缓存: ${result.networkCacheSize || 0} 条${result.debuggerAttached ? "" : " (调试器未连接!)"}`,
     result.gameDetected ? "" : `缓冲队列: ${result.bufferSize || 0} 条`,
     `目录: ${result.folder}/`
@@ -210,17 +211,18 @@ captureBtn.addEventListener("click", async () => {
 
     const result = await chrome.runtime.sendMessage({
       type: "CAPTURE_HTML",
-      tabId: tab.id
+      tabId: tab.id,
+      force: true
     });
 
     if (!result) throw new Error("后台无响应。");
     if (!result.ok) throw new Error(result.error || "生成失败。");
 
-    setStatus(`生成成功！\n${result.message}`);
+    setStatus(result.skipped ? result.message : `生成成功！\n${result.message}`);
   } catch (error) {
     setError(`生成失败: ${error.message}`);
   } finally {
-    captureBtn.textContent = "生成 HTML（游戏加载后点）";
+    captureBtn.textContent = "重新生成 HTML";
     captureBtn.disabled = false;
   }
 });

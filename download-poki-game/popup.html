@@ -177,7 +177,7 @@
       <h1>Poki 游戏下载器</h1>
       <button type="button" id="clearConfigBtn" class="secondary clear-config-btn">清空配置</button>
     </div>
-    <p>先开启监听，再刷新页面进入游戏。<br/>检测到游戏后资源自动下载。<br/>游戏加载完成后点「生成 HTML」或直接停止。</p>
+    <p>先开启监听，再刷新页面进入游戏。<br/>检测到游戏后资源自动下载；游戏 HTML 缓存就绪后会自动生成 index.html（已存在则跳过）。</p>
 
     <div class="config-section">
       <h2>本地写盘服务</h2>
@@ -195,7 +195,7 @@
 
 
     <button id="startBtn">开始监听当前标签页</button>
-    <button id="captureBtn" class="secondary" disabled>生成 HTML（游戏加载后点）</button>
+    <button id="captureBtn" class="secondary" disabled>重新生成 HTML</button>
     <button id="stopBtn" class="secondary" disabled>停止监听并写入清单</button>
     <div id="status" class="status"></div>
 

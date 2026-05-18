@@ -205,6 +205,27 @@ export function flushQueue() {
   return flushChain;
 }
 
+export async function readText(relPath) {
+  if (!isEnabled() || !sessionId) return null;
+  const data = await api("/api/file/read", {
+    method: "POST",
+    body: { sessionId, relPath }
+  });
+  if (!data?.exists || data.content == null) return null;
+  return String(data.content);
+}
+
+export async function saveText(relPath, text, { overwrite = true } = {}) {
+  if (!isEnabled()) return null;
+  await flushQueue();
+  return ingestImmediate({
+    relPath,
+    body: text,
+    encoding: "utf8",
+    overwrite
+  });
+}
+
 export async function resumeSession(opts) {
   if (!isEnabled()) return null;
   if (sessionId) return { sessionId, resumed: false };

@@ -1,4 +1,10 @@
 import * as localSink from "./local-sink.js";
+import { scrapePokiPortalPage } from "./portal-scraper.js";
+import { mergeManifest, hydrateSessionFiles } from "./assets-manifest-lib.js";
+
+const MANIFEST_REL_PATH = "assets-manifest.json";
+
+const INFO_ASSETS_DIR = "__info_assets__";
 
 
 /** 下载选项：chrome.downloads 回退时使用 */
@@ -20,8 +26,16 @@ let pendingNetworkCaptures = new Map();
 const networkHtmlCache = new Map();
 let gameframeTimer = null;
 let requestBuffer = [];
+let htmlAutoCaptureTimer = null;
+let htmlAutoCaptureInFlight = false;
+
+
 
 const sessionReady = restoreSession();
+
+localSink.setFlushHandler((data) => {
+  if (activeSession) applyAllIngestResults(data);
+});
 
 /* ── Chrome message listener ───────────────────────────────── */
 
@@ -64,7 +78,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "CAPTURE_HTML") {
     sessionReady
-      .then(() => captureAndSaveHtml(message.tabId))
+      .then(() => captureAndSaveHtml(message.tabId, { force: !!message.force }))
       .then((r) => sendResponse({ ok: true, ...r }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -244,6 +258,13 @@ async function captureResponseBody(tabId, requestId, info) {
       const baseUrl = info.url.split("?")[0];
       if (baseUrl !== info.url) networkHtmlCache.set(baseUrl, bodyDecoded);
       console.log(`[poki-dl] HTML cached: ${info.url.slice(0, 100)} (${bodyDecoded.length} bytes, total=${networkHtmlCache.size})`);
+      if (activeSession?.gameUrl) {
+        const gameBase = activeSession.gameUrl.split("?")[0];
+        const cachedBase = info.url.split("?")[0];
+        if (cachedBase === gameBase || info.url === activeSession.gameUrl) {
+          scheduleAutoCaptureHtml(tabId, "html-cached");
+        }
+      }
     }
 
     if (!activeSession || activeSession.tabId !== tabId) return;
@@ -410,6 +431,10 @@ function stopGameframeDetection() {
     clearInterval(gameframeTimer);
     gameframeTimer = null;
   }
+  if (htmlAutoCaptureTimer) {
+    clearTimeout(htmlAutoCaptureTimer);
+    htmlAutoCaptureTimer = null;
+  }
 }
 
 async function detectGameframe(tabId) {
@@ -446,6 +471,7 @@ async function onGameframeDetected(tabId, src) {
   }
   await flushRequestBuffer();
   await persistSession();
+  scheduleAutoCaptureHtml(tabId, "gameframe");
 }
 
 async function flushRequestBuffer() {
@@ -576,12 +602,22 @@ async function startMonitor(tabId, options = {}) {
     console.log("[poki-dl] 本地服务会话:", started.sessionId, started.gameDir);
   }
 
+  if (await isIndexHtmlOnDisk()) {
+    activeSession.htmlCaptured = true;
+    console.log("[poki-dl] 检测到已有 index.html，跳过自动生成");
+  }
+
+  await hydrateSessionFromManifestOnDisk();
+  void writeManifest();
+
   requestBuffer = [];
   networkHtmlCache.clear();
 
   const dbgOk = await attachDebugger(tabId);
 
   startGameframeDetection(tabId);
+
+  schedulePortalScrape(tabId);
 
   await persistSession();
   await chrome.storage.local.set({ lastGameInfo: { gameName, folder } });
@@ -597,13 +633,82 @@ async function startMonitor(tabId, options = {}) {
   };
 }
 
-async function captureAndSaveHtml(tabId) {
+async function isIndexHtmlOnDisk() {
+  if (!activeSession) return false;
+  const rel = "index.html";
+  if (
+    activeSession.files?.some(
+      (f) => f.localPath === rel && f.status === "ok"
+    )
+  ) {
+    return true;
+  }
+  if (localSink.isEnabled()) {
+    try {
+      await ensureLocalSinkSession();
+      return await localSink.fileExists(rel);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function scheduleAutoCaptureHtml(tabId, reason = "") {
+  if (!activeSession || activeSession.tabId !== tabId) return;
+  if (activeSession.htmlCaptured) return;
+  if (htmlAutoCaptureTimer) clearTimeout(htmlAutoCaptureTimer);
+  htmlAutoCaptureTimer = setTimeout(() => {
+    htmlAutoCaptureTimer = null;
+    void tryAutoCaptureHtml(tabId, reason);
+  }, 800);
+}
+
+async function tryAutoCaptureHtml(tabId, reason = "") {
+  if (!activeSession || activeSession.tabId !== tabId) return;
+  if (htmlAutoCaptureInFlight || activeSession.htmlCaptured) return;
+
+  if (await isIndexHtmlOnDisk()) {
+    activeSession.htmlCaptured = true;
+    console.log("[poki-dl] index.html 已存在，跳过自动生成");
+    schedulePersist();
+    return;
+  }
+
+  if (!activeSession.gameUrl || !findInNetworkCache(activeSession.gameUrl)) return;
+
+  htmlAutoCaptureInFlight = true;
+  try {
+    const r = await captureAndSaveHtml(tabId, { auto: true });
+    if (!r?.skipped) {
+      console.log(`[poki-dl] 已自动生成 HTML${reason ? ` (${reason})` : ""}`);
+    }
+  } catch (e) {
+    console.log(`[poki-dl] 自动生成 HTML 等待中: ${e.message}`);
+  } finally {
+    htmlAutoCaptureInFlight = false;
+  }
+}
+
+async function captureAndSaveHtml(tabId, options = {}) {
+  const { force = false, auto = false } = options;
   if (!activeSession || activeSession.tabId !== tabId) {
     throw new Error("当前没有监听会话。");
   }
 
   if (localSink.isEnabled()) {
     await ensureLocalSinkSession();
+  }
+
+  if (!force) {
+    if (activeSession.htmlCaptured || (await isIndexHtmlOnDisk())) {
+      activeSession.htmlCaptured = true;
+      await persistSession();
+      return {
+        message: "index.html 已存在，跳过生成",
+        skipped: true
+      };
+    }
   }
 
   const gameUrl = activeSession.gameUrl;
@@ -625,7 +730,11 @@ async function captureAndSaveHtml(tabId) {
   activeSession.htmlCaptured = true;
   await persistSession();
 
-  return { message: "已生成 index.html、poki-sdk-stub.js、master-loader.js、unity-2020.js" };
+  return {
+    message: auto
+      ? "已自动生成 index.html、poki-sdk-stub.js、master-loader.js、unity-2020.js"
+      : "已生成 index.html、poki-sdk-stub.js、master-loader.js、unity-2020.js"
+  };
 }
 
 async function stopMonitor(tabId) {
@@ -636,9 +745,9 @@ async function stopMonitor(tabId) {
   stopGameframeDetection();
   const errors = [];
 
-  if (!activeSession.htmlCaptured && activeSession.gameUrl) {
+  if (activeSession.gameUrl && !activeSession.htmlCaptured) {
     try {
-      await captureAndSaveHtml(tabId);
+      await tryAutoCaptureHtml(tabId, "stop");
     } catch (e) {
       errors.push(e.message);
     }
@@ -651,23 +760,21 @@ async function stopMonitor(tabId) {
   activeSession.status = "stopped";
   activeSession.stoppedAt = new Date().toISOString();
 
+  if (!activeSession.portalInfo) {
+    try {
+      await scrapeAndSavePortalInfo(tabId);
+    } catch (e) {
+      errors.push(`portalInfo: ${e.message}`);
+    }
+  }
+
   try {
     if (localSink.isEnabled()) {
-      await localSink.flushQueue();
+      await flushLocalSinkAndApply();
     }
     await writeManifest();
     if (localSink.isEnabled() && activeSession.localSessionId) {
-      const manifest = {
-        gameName: activeSession.gameName,
-        pageUrl: activeSession.pageUrl,
-        gameUrl: activeSession.gameUrl || "",
-        engine: detectGameEngine(),
-        startedAt: activeSession.startedAt,
-        stoppedAt: activeSession.stoppedAt,
-        status: activeSession.status,
-        stats: activeSession.stats,
-        files: activeSession.files
-      };
+      const manifest = buildManifestPayloadFromSession();
       await localSink.finishSession(manifest);
     }
   } catch (e) {
@@ -1456,12 +1563,16 @@ function toRelPath(filename) {
 
 function applyIngestResult(result, sourceUrl, localPath, requestType) {
   if (!activeSession || !result) return;
+  const alreadyTracked = activeSession.downloadedLocalPaths.has(localPath);
+  const existing = activeSession.files.find((f) => f.localPath === localPath);
+  const resolvedSourceUrl = sourceUrl || existing?.sourceUrl || "";
+
   if (result.status === "skipped") {
-    activeSession.stats.skipped += 1;
+    if (!alreadyTracked) activeSession.stats.skipped += 1;
     activeSession.downloadedLocalPaths.add(localPath);
     upsertFile({
       type: "asset",
-      sourceUrl: sourceUrl || "",
+      sourceUrl: resolvedSourceUrl,
       localPath,
       status: "ok",
       requestType,
@@ -1470,21 +1581,21 @@ function applyIngestResult(result, sourceUrl, localPath, requestType) {
     return;
   }
   if (result.status === "ok") {
-    activeSession.stats.downloaded += 1;
+    if (!alreadyTracked) activeSession.stats.downloaded += 1;
     activeSession.downloadedLocalPaths.add(localPath);
     upsertFile({
       type: "asset",
-      sourceUrl: sourceUrl || "",
+      sourceUrl: resolvedSourceUrl,
       localPath,
       status: "ok",
       requestType
     });
     return;
   }
-  activeSession.stats.failed += 1;
+  if (!alreadyTracked) activeSession.stats.failed += 1;
   upsertFile({
     type: "asset",
-    sourceUrl: sourceUrl || "",
+    sourceUrl: resolvedSourceUrl,
     localPath,
     status: "failed",
     requestType,
@@ -1492,9 +1603,23 @@ function applyIngestResult(result, sourceUrl, localPath, requestType) {
   });
 }
 
-function findIngestResult(results, relPath) {
-  if (!Array.isArray(results)) return null;
-  return results.find((r) => r.relPath === relPath) || results[results.length - 1];
+function applyAllIngestResults(data) {
+  if (!activeSession || !data?.results?.length) return;
+  for (const result of data.results) {
+    const relPath = result.relPath;
+    if (!relPath) continue;
+    const sourceUrl = result._sourceUrl ?? result.sourceUrl ?? "";
+    const requestType = result._requestType ?? "url";
+    applyIngestResult(result, sourceUrl, relPath, requestType);
+  }
+  schedulePersist();
+  scheduleManifest();
+  void updateBadgeCount();
+}
+
+async function flushLocalSinkAndApply() {
+  if (!localSink.isEnabled()) return { results: [] };
+  return localSink.flushQueue();
 }
 
 async function saveDataUrl(localPath, dataUrl, sourceUrl = "", requestType = "data-url") {
@@ -1507,7 +1632,7 @@ async function saveDataUrl(localPath, dataUrl, sourceUrl = "", requestType = "da
   const body = dataUrl.slice(comma + 1);
   const encoding = meta.includes(";base64") ? "base64" : "utf8";
   await ensureLocalSinkSession();
-  await localSink.flushQueue();
+  await flushLocalSinkAndApply();
   const result = await localSink.ingestImmediate({
     relPath: localPath,
     body,
@@ -1527,14 +1652,11 @@ async function downloadUrl(url, filename, requestType = "url") {
   const localPath = toRelPath(filename);
   if (localSink.isEnabled()) {
     await ensureLocalSinkSession();
-    localSink.enqueueUrl(url, localPath);
-    const data = await localSink.flushQueue();
-    const result = findIngestResult(data?.results, localPath);
-    if (result) {
-      applyIngestResult(result, url, localPath, requestType);
-      if (result.status === "failed") {
-        throw new Error(result.error || "ingest failed");
-      }
+    localSink.enqueueUrl(url, localPath, requestType);
+    const data = await flushLocalSinkAndApply();
+    const result = data?.results?.find((r) => r.relPath === localPath);
+    if (result?.status === "failed") {
+      throw new Error(result.error || "ingest failed");
     }
     return;
   }
@@ -1556,7 +1678,7 @@ async function downloadText(filename, textContent, mimeType) {
   const localPath = toRelPath(filename);
   if (localSink.isEnabled()) {
     await ensureLocalSinkSession();
-    await localSink.flushQueue();
+    await flushLocalSinkAndApply();
     const result = await localSink.saveText(localPath, textContent, { overwrite: true });
     applyIngestResult(result, "", localPath, "text");
     if (result?.status === "failed") {
@@ -1615,7 +1737,8 @@ function buildStatusPayload() {
     networkCacheSize: networkHtmlCache.size,
     debuggerAttached,
     bufferSize: requestBuffer.length,
-    sinkMode: activeSession.sinkMode || "chrome-downloads"
+    sinkMode: activeSession.sinkMode || "chrome-downloads",
+    portalInfoSaved: !!activeSession.portalInfo
   };
 }
 
@@ -1641,7 +1764,71 @@ function scheduleManifest() {
   manifestTimer = setTimeout(() => {
     manifestTimer = null;
     void writeManifest();
-  }, 8000);
+  }, 3000);
+}
+
+function buildManifestPayloadFromSession() {
+  if (!activeSession) return null;
+  return {
+    manifestVersion: 1,
+    gameName: activeSession.gameName,
+    pageUrl: activeSession.pageUrl,
+    gameUrl: activeSession.gameUrl || "",
+    portalInfo: activeSession.portalInfo || null,
+    engine: detectGameEngine(),
+    startedAt: activeSession.startedAt,
+    stoppedAt: activeSession.stoppedAt || "",
+    status: activeSession.status,
+    stats: activeSession.stats,
+    files: activeSession.files
+  };
+}
+
+async function readExistingManifestFromDisk() {
+  if (!activeSession) return null;
+  if (localSink.isEnabled()) {
+    try {
+      await ensureLocalSinkSession();
+      const text = await localSink.readText(MANIFEST_REL_PATH);
+      if (text) return JSON.parse(text);
+    } catch (e) {
+      console.warn("[poki-dl] 读取 manifest 失败:", e.message);
+    }
+    return null;
+  }
+  return null;
+}
+
+async function saveManifestJson(merged) {
+  if (!activeSession) return;
+  const json = JSON.stringify(merged, null, 2);
+  if (localSink.isEnabled()) {
+    await ensureLocalSinkSession();
+    await flushLocalSinkAndApply();
+    await localSink.saveText(MANIFEST_REL_PATH, json, { overwrite: true });
+    return;
+  }
+  const filename = `${activeSession.folder}/${MANIFEST_REL_PATH}`;
+  const bytes = new TextEncoder().encode(json);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const dataUrl = `data:application/json;charset=utf-8;base64,${btoa(binary)}`;
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      { url: dataUrl, filename, ...DOWNLOAD_OPTS },
+      (downloadId) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(downloadId);
+      }
+    );
+  });
+}
+
+async function hydrateSessionFromManifestOnDisk() {
+  const existing = await readExistingManifestFromDisk();
+  if (existing) hydrateSessionFiles(activeSession, existing);
 }
 
 async function persistSession() {
@@ -1704,10 +1891,18 @@ async function restoreSession() {
       }
     }
 
+    if (activeSession.htmlCaptured || (await isIndexHtmlOnDisk())) {
+      activeSession.htmlCaptured = true;
+    }
+
+    await hydrateSessionFromManifestOnDisk();
+
     if (activeSession.tabId) {
       void attachDebugger(activeSession.tabId);
       if (!activeSession.gameHost) {
         startGameframeDetection(activeSession.tabId);
+      } else if (!activeSession.htmlCaptured && activeSession.gameUrl) {
+        scheduleAutoCaptureHtml(activeSession.tabId, "restore");
       }
     }
 
@@ -1723,22 +1918,92 @@ async function restoreSession() {
 
 async function writeManifest() {
   if (!activeSession) return;
-  const payload = {
-    gameName: activeSession.gameName,
-    pageUrl: activeSession.pageUrl,
-    gameUrl: activeSession.gameUrl || "",
-    engine: detectGameEngine(),
-    startedAt: activeSession.startedAt,
-    stoppedAt: activeSession.stoppedAt || "",
-    status: activeSession.status,
-    stats: activeSession.stats,
-    files: activeSession.files
+  const incoming = buildManifestPayloadFromSession();
+  if (!incoming) return;
+  let existing = null;
+  try {
+    existing = await readExistingManifestFromDisk();
+  } catch (e) {
+    console.warn("[poki-dl] merge manifest read:", e.message);
+  }
+  const merged = mergeManifest(existing, incoming);
+  await saveManifestJson(merged);
+}
+
+/* ── Portal info (Poki 游戏页 article / 元数据) ─────────────── */
+
+function schedulePortalScrape(tabId) {
+  const run = () => {
+    if (!activeSession || activeSession.tabId !== tabId) return;
+    void scrapeAndSavePortalInfo(tabId);
   };
-  await downloadText(
-    `${activeSession.folder}/assets-manifest.json`,
-    JSON.stringify(payload, null, 2),
-    "application/json;charset=utf-8"
-  );
+  setTimeout(run, 1500);
+  setTimeout(run, 5000);
+}
+
+async function scrapeAndSavePortalInfo(tabId) {
+  if (!activeSession || activeSession.tabId !== tabId) return { ok: false };
+
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: scrapePokiPortalPage
+    });
+    const scraped = results?.[0]?.result;
+    if (!scraped?.meta) {
+      console.warn("[poki-dl] portal scrape: 无结果（可能 article 未加载）");
+      return { ok: false, error: "empty scrape" };
+    }
+
+    const folder = activeSession.folder;
+    const base = `${folder}/${INFO_ASSETS_DIR}`;
+
+    await downloadText(
+      `${base}/meta.json`,
+      JSON.stringify(scraped.meta, null, 2),
+      "application/json;charset=utf-8"
+    );
+
+    if (scraped.articleHtml) {
+      await downloadText(
+        `${base}/article.html`,
+        scraped.articleHtml,
+        "text/html;charset=utf-8"
+      );
+    }
+
+    for (const asset of scraped.assets || []) {
+      try {
+        await downloadUrl(
+          asset.url,
+          `${base}/${asset.filename}`,
+          "portal-asset"
+        );
+      } catch (e) {
+        console.warn("[poki-dl] portal asset:", asset.url, e.message);
+      }
+    }
+
+    activeSession.portalInfo = scraped.meta;
+    upsertFile({
+      type: "portal-info",
+      sourceUrl: scraped.meta.portalUrl,
+      localPath: `${INFO_ASSETS_DIR}/meta.json`,
+      status: "ok"
+    });
+    schedulePersist();
+    scheduleManifest();
+
+    console.log(
+      "[poki-dl] portal info:",
+      scraped.meta.title,
+      `→ ${base}/`
+    );
+    return { ok: true, meta: scraped.meta };
+  } catch (e) {
+    console.warn("[poki-dl] portal scrape failed:", e.message);
+    return { ok: false, error: e.message };
+  }
 }
 
 /* ── Page info ─────────────────────────────────────────────── */

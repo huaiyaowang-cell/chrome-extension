@@ -13,12 +13,28 @@ let settings = null;
 /** @type {string | null} */
 let sessionId = null;
 
-/** @type {{ sourceUrl?: string, relPath: string, body?: string, encoding?: string }[]} */
+/** @type {{ sourceUrl?: string, relPath: string, requestType?: string, body?: string, encoding?: string }[]} */
 let pendingBatch = [];
 
 let flushTimer = null;
 /** @type {Promise<{ results: object[] }>} */
 let flushChain = Promise.resolve({ results: [] });
+
+/** @type {((data: { results: object[] }) => void) | null} */
+let flushHandler = null;
+
+export function setFlushHandler(fn) {
+  flushHandler = typeof fn === "function" ? fn : null;
+}
+
+function notifyFlushHandler(data) {
+  if (!flushHandler || !data?.results?.length) return;
+  try {
+    flushHandler(data);
+  } catch (e) {
+    console.warn("[local-sink] flush handler error:", e);
+  }
+}
 
 function mergeSinkSettings(saved = {}, overrides = {}) {
   const serverUrl = String(overrides.serverUrl ?? saved.serverUrl ?? DEFAULT_SERVER_URL)
@@ -201,8 +217,8 @@ export async function resumeSession(opts) {
   return { sessionId: data.sessionId, resumed: true };
 }
 
-export function enqueueUrl(sourceUrl, relPath) {
-  pendingBatch.push({ sourceUrl, relPath });
+export function enqueueUrl(sourceUrl, relPath, requestType = "url") {
+  pendingBatch.push({ sourceUrl, relPath, requestType });
   if (pendingBatch.length >= BATCH_SIZE) {
     void flushQueue();
   } else {
@@ -215,19 +231,50 @@ async function drainPending() {
   while (pendingBatch.length > 0) {
     const batch = pendingBatch.splice(0, BATCH_SIZE);
     const data = await ingestBatch(batch);
-    if (data?.results?.length) allResults.push(...data.results);
+    const results = data?.results;
+    if (!Array.isArray(results)) continue;
+    for (let i = 0; i < results.length; i++) {
+      const item = batch[i];
+      allResults.push({
+        ...results[i],
+        _sourceUrl: item?.sourceUrl || "",
+        _requestType: item?.requestType || "url"
+      });
+    }
   }
   return { results: allResults };
 }
 
 export function flushQueue() {
-  flushChain = flushChain.then(() => drainPending());
+  flushChain = flushChain.then(async () => {
+    const data = await drainPending();
+    notifyFlushHandler(data);
+    return data;
+  });
   return flushChain;
+}
+
+export async function fileExists(relPath) {
+  if (!isEnabled() || !sessionId) return false;
+  const data = await api("/api/file/stat", {
+    method: "POST",
+    body: { sessionId, relPath }
+  });
+  return !!data?.exists;
+}
+
+export async function readText(relPath) {
+  if (!isEnabled() || !sessionId) return null;
+  const data = await api("/api/file/read", {
+    method: "POST",
+    body: { sessionId, relPath }
+  });
+  if (!data?.exists || data.content == null) return null;
+  return String(data.content);
 }
 
 export async function saveText(relPath, text, { overwrite = true } = {}) {
   if (!isEnabled()) return null;
-  await flushQueue();
   return ingestImmediate({
     relPath,
     body: text,

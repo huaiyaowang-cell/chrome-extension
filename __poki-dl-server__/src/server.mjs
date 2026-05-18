@@ -90,6 +90,69 @@ async function fileExists(absPath) {
   }
 }
 
+function manifestFileKey(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  if (entry.localPath) return `path:${entry.localPath}`;
+  if (entry.sourceUrl) return `url:${entry.sourceUrl}`;
+  return null;
+}
+
+/** 合并 assets-manifest.json（与扩展 assets-manifest-lib.js 逻辑一致） */
+function mergeManifestOnDisk(existing, incoming) {
+  const prev = existing && typeof existing === "object" ? existing : {};
+  const next = incoming && typeof incoming === "object" ? incoming : {};
+  const fileMap = new Map();
+  for (const f of prev.files || []) {
+    const key = manifestFileKey(f);
+    if (key) fileMap.set(key, { ...f });
+  }
+  for (const f of next.files || []) {
+    const key = manifestFileKey(f);
+    if (!key) continue;
+    const old = fileMap.get(key) || {};
+    fileMap.set(key, {
+      ...old,
+      ...f,
+      updatedAt: f.updatedAt || new Date().toISOString()
+    });
+  }
+  const files = [...fileMap.values()];
+  const stats = { totalSeen: 0, downloaded: 0, failed: 0, skipped: 0 };
+  for (const f of files) {
+    stats.totalSeen += 1;
+    if (f.status === "failed") stats.failed += 1;
+    else if (f.skipped) stats.skipped += 1;
+    else stats.downloaded += 1;
+  }
+  return {
+    manifestVersion: 1,
+    ...prev,
+    ...next,
+    gameName: next.gameName || prev.gameName || "",
+    gameUrl: next.gameUrl || prev.gameUrl || "",
+    pageUrl: next.pageUrl || prev.pageUrl || "",
+    portalInfo: next.portalInfo !== undefined ? next.portalInfo : prev.portalInfo ?? null,
+    engine: next.engine || prev.engine || "",
+    startedAt: prev.startedAt || next.startedAt || "",
+    stoppedAt: next.stoppedAt || prev.stoppedAt || "",
+    status: next.status || prev.status || "",
+    updatedAt: new Date().toISOString(),
+    stats,
+    files
+  };
+}
+
+async function readTextFile(absPath) {
+  try {
+    const st = await fs.stat(absPath);
+    if (!st.isFile()) return { exists: false };
+    const content = await fs.readFile(absPath, "utf8");
+    return { exists: true, bytes: st.size, content };
+  } catch {
+    return { exists: false };
+  }
+}
+
 async function writeBody(absPath, body, encoding) {
   await fs.mkdir(path.dirname(absPath), { recursive: true });
   const tmp = `${absPath}.${process.pid}.${Date.now()}.tmp`;
@@ -248,7 +311,6 @@ async function handleRequest(req, res) {
         String(body.outputRoot || DEFAULT_OUTPUT_ROOT).trim()
       );
       const relPrefix = String(body.relPrefix || gameName)
-        .replace(/^\/+|\/+$/g, "");
         .replace(/\\/g, "/")
         .replace(/^\/+|\/+$/g, "");
       const gameDir = path.join(outputRoot, relPrefix);
@@ -287,11 +349,15 @@ async function handleRequest(req, res) {
       }
       if (body.manifest) {
         const manifestPath = path.join(session.gameDir, "assets-manifest.json");
-        await fs.writeFile(
-          manifestPath,
-          JSON.stringify(body.manifest, null, 2),
-          "utf8"
-        );
+        let existing = null;
+        try {
+          const raw = await fs.readFile(manifestPath, "utf8");
+          existing = JSON.parse(raw);
+        } catch {
+          /* 首次写入 */
+        }
+        const merged = mergeManifestOnDisk(existing, body.manifest);
+        await fs.writeFile(manifestPath, JSON.stringify(merged, null, 2), "utf8");
       }
       const stats = {
         downloaded: session.downloaded,
@@ -318,6 +384,29 @@ async function handleRequest(req, res) {
         },
         queue: jobQueue.filter((j) => j.sessionId === sessionId).length
       });
+    }
+
+    if (method === "POST" && url.pathname === "/api/file/stat") {
+      const body = await readJson(req);
+      const session = sessions.get(body.sessionId);
+      if (!session) return json(res, 404, { ok: false, error: "session not found" });
+      const { relPath: safeRel, abs } = safeResolve(session.gameDir, body.relPath);
+      const exists = await fileExists(abs);
+      let bytes = 0;
+      if (exists) {
+        const st = await fs.stat(abs);
+        bytes = st.size;
+      }
+      return json(res, 200, { ok: true, exists, relPath: safeRel, bytes });
+    }
+
+    if (method === "POST" && url.pathname === "/api/file/read") {
+      const body = await readJson(req);
+      const session = sessions.get(body.sessionId);
+      if (!session) return json(res, 404, { ok: false, error: "session not found" });
+      const { relPath: safeRel, abs } = safeResolve(session.gameDir, body.relPath);
+      const file = await readTextFile(abs);
+      return json(res, 200, { ok: true, relPath: safeRel, ...file });
     }
 
     if (method === "POST" && url.pathname === "/api/assets/ingest") {

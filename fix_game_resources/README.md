@@ -10,7 +10,9 @@
 | 输出根目录 | 弹窗「输出根目录」 | **共用** `pokiSinkSettings` |
 | 游戏目录 | `downloaded-games/<游戏名>/` | 下载目录填 `downloaded-games`，游戏名一致 |
 
-落盘路径：`{输出根目录}/downloaded-games/<游戏名>/<相对路径>`
+落盘路径：`{输出根目录}/<游戏名>/<相对路径>`
+
+每次成功补全 404 资源后，会**合并写入**同目录下的 `assets-manifest.json`（不覆盖已有条目）。
 
 例如输出根为 `/Users/you/work/chrome-extension/games` 时：
 

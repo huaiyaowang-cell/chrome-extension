@@ -37,7 +37,8 @@ cd tools/poki-dl-server && npm start
 5. 在刷新前点击插件按钮，选择「开始监听当前标签页」
 6. 刷新页面并正常进入游戏
 7. 插件会实时监听当前标签页的核心请求并持续下载
-8. 完成后点击「停止监听并写入清单」
+8. 检测到 gameframe 且 HTML 已进入网络缓存后，会**自动生成** `index.html`（本地已有则跳过）
+9. 完成后点击「停止监听并写入清单」
 
 ## 下载目录
 
@@ -50,11 +51,22 @@ cd tools/poki-dl-server && npm start
 - `downloaded-games/happy-glass/assets-manifest.json`
 - `downloaded-games/happy-glass/assets/...`
 
-其中 `assets-manifest.json` 记录每个资源的：
+开始监听后还会抓取 Poki 入口页信息，写入 `{游戏名}/__info_assets__/`：
 
-- 原始地址 `sourceUrl`
-- 本地路径 `localPath`
-- 下载状态 `status`（`ok` / `failed`）
+- `meta.json` — 标题、开发商、评分、投票、Like/Dislike、描述小节、FAQ、表格等
+- `article.html` — `article` 元素 HTML 快照
+- `icon.*` — 来自 `og:image` 的游戏图标
+
+`assets-manifest.json` 会在下载过程中**自动合并写入**（约每 3 秒，或停止监听时）；多次写入会按 `localPath` / `sourceUrl` 合并条目，不会整文件覆盖丢失历史。
+
+每条资源记录包含：
+
+- `sourceUrl` — CDN 原始地址（用于按清单重新下载）
+- `localPath` — 相对游戏目录的路径
+- `status` — `ok` / `failed`
+- 可选 `requestType`、`updatedAt` 等
+
+顶层字段 `gameUrl` 为游戏 CDN 根地址，供 **fix_game_resources** 补全 404 时使用。
 
 ## 404 资源补全
 
