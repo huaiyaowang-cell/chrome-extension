@@ -14,12 +14,32 @@ const STORAGE_LISTENING = "fixGameResources_listeningTabId";
 /** @deprecated 旧版 storage 可能含 downloadDir，已忽略 */
 const LEGACY_DOWNLOAD_DIR = "downloaded-games";
 
-/** @type {{ relPrefix: string, gameName: string, domain: string, pageUrl: string } | null} */
+/** @type {{ relPrefix: string, gameName: string, domain: string, pageUrl: string, pageKey: string } | null} */
 let activeFixSession = null;
 
 let syncDebounceTimer = null;
 /** @type {string} */
 let lastSyncedPageKey = "";
+/** @type {string} 当前监听页面对应的游戏目录名（URL 最后一段） */
+let lastSyncedGameSlug = "";
+
+/** 串行化 404 下载，避免并发 startSession / flush 竞态 */
+let downloadQueue = Promise.resolve();
+
+/** 串行化 manifest 同步（与 404 下载队列配合，避免竞态） */
+let settingsSyncChain = Promise.resolve();
+
+function enqueueDownloadJob(fn) {
+  const job = downloadQueue.then(() => fn());
+  downloadQueue = job.catch(() => {});
+  return job;
+}
+
+function enqueueSettingsSync(fn) {
+  const job = settingsSyncChain.then(() => fn());
+  settingsSyncChain = job.catch(() => {});
+  return job;
+}
 
 /* ── 监听状态 ───────────────────────────────────────────────── */
 
@@ -170,11 +190,16 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
   }
 
   const pageKey = pageUrl.split("#")[0];
-  if (!force && pageKey === lastSyncedPageKey) {
-    return { changed: false, settings: await getSettings() };
-  }
-
   const gameNameFromUrl = parseGameNameFromUrl(pageUrl);
+  const prev = await getSettings();
+  const gameSwitched =
+    !!gameNameFromUrl &&
+    !!prev.gameName &&
+    gameNameFromUrl !== prev.gameName;
+
+  if (!force && pageKey === lastSyncedPageKey && !gameSwitched) {
+    return { changed: false, settings: prev };
+  }
   let domain = "";
   let gameName = gameNameFromUrl;
 
@@ -210,7 +235,6 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
     };
   }
 
-  const prev = await getSettings();
   const next = {
     domain,
     gameName: gameName || prev.gameName || gameNameFromUrl
@@ -221,6 +245,18 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
   if (valuesChanged || force) {
     await saveSettingsToStorage(next);
     if (valuesChanged) {
+      try {
+        await downloadQueue;
+      } catch {
+        /* 队列中某项失败不影响重置会话 */
+      }
+      if (localSink.isEnabled()) {
+        try {
+          await localSink.flushQueue();
+        } catch (e) {
+          console.warn("[fix_game_resources] flush before session reset:", e.message);
+        }
+      }
       localSink.clearSession();
       activeFixSession = null;
     }
@@ -235,14 +271,71 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
   return { changed: false, settings: next };
 }
 
-function scheduleSyncFromTab(tabId, pageUrl) {
+function notifySettingsSynced(sync) {
+  try {
+    chrome.runtime.sendMessage({
+      type: "SETTINGS_AUTO_SYNCED",
+      settings: sync.settings,
+      changed: !!sync.changed,
+      error: sync.error || null
+    });
+  } catch {
+    /* popup 未打开时无接收方 */
+  }
+}
+
+async function reset404ListForTab(tabId, pageUrl) {
+  const data = await get404Storage();
+  data[tabId] = { pageUrl, list: [], failed: [] };
+  await chrome.storage.local.set({ [STORAGE_404]: data });
+}
+
+async function runSyncFromTab(tabId, pageUrl, options = {}) {
+  return enqueueSettingsSync(async () => {
+    const listening = await getListeningTabId();
+    if (listening === null || listening !== tabId) return null;
+
+    const gameSlug = parseGameNameFromUrl(pageUrl);
+    const gameChanged = !!gameSlug && gameSlug !== lastSyncedGameSlug;
+
+    if (gameChanged) {
+      try {
+        await downloadQueue;
+      } catch {
+        /* 上一游戏遗留下载失败不阻塞切换 */
+      }
+      await reset404ListForTab(tabId, pageUrl);
+      console.log("[fix_game_resources] 已切换游戏，404 列表已清空:", gameSlug);
+    }
+
+    const sync = await syncSettingsFromPageUrl(pageUrl, {
+      force: !!options.force || gameChanged
+    });
+
+    if (gameSlug) lastSyncedGameSlug = gameSlug;
+
+    notifySettingsSynced(sync);
+    return sync;
+  });
+}
+
+function scheduleSyncFromTab(tabId, pageUrl, options = {}) {
+  const gameSlug = parseGameNameFromUrl(pageUrl);
+  const gameChanged = !!gameSlug && gameSlug !== lastSyncedGameSlug;
+
+  if (options.immediate || gameChanged) {
+    if (syncDebounceTimer) {
+      clearTimeout(syncDebounceTimer);
+      syncDebounceTimer = null;
+    }
+    void runSyncFromTab(tabId, pageUrl, options);
+    return;
+  }
+
   if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
   syncDebounceTimer = setTimeout(() => {
-    void (async () => {
-      const listening = await getListeningTabId();
-      if (listening === null || listening !== tabId) return;
-      await syncSettingsFromPageUrl(pageUrl);
-    })();
+    syncDebounceTimer = null;
+    void runSyncFromTab(tabId, pageUrl, options);
   }, 350);
 }
 
@@ -253,7 +346,22 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const pageUrl = changeInfo.url || tab?.url || "";
     if (!pageUrl.startsWith("http")) return;
     if (changeInfo.url || changeInfo.status === "complete") {
-      scheduleSyncFromTab(tabId, pageUrl);
+      scheduleSyncFromTab(tabId, pageUrl, { immediate: !!changeInfo.url });
+    }
+  })();
+});
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  void (async () => {
+    const listening = await getListeningTabId();
+    if (listening === null || activeInfo.tabId !== listening) return;
+    try {
+      const tab = await chrome.tabs.get(activeInfo.tabId);
+      const pageUrl = tab.url || "";
+      if (!pageUrl.startsWith("http")) return;
+      scheduleSyncFromTab(activeInfo.tabId, pageUrl, { immediate: true });
+    } catch {
+      /* tab 可能已关闭 */
     }
   })();
 });
@@ -313,18 +421,28 @@ function buildRemoteAndLocal(settings, pageUrl, encodedRel) {
 
 async function ensureFixSession(settings, pageUrl) {
   if (!localSink.isEnabled()) return;
+  await localSink.loadSettings();
+  if (!localSink.getSettings()?.outputRoot) {
+    throw new Error("请填写「输出根目录」并确认本地服务可用");
+  }
   let gameName = (settings.gameName || "").trim();
   if (!gameName) gameName = parseGameNameFromUrl(pageUrl);
+  if (!gameName) {
+    throw new Error("无法确定游戏名（请确认在游戏目录页或 manifest 中有 gameName）");
+  }
   const relPrefix = gameName;
   const domainNorm = normalizeGameDomainUrl(settings.domain);
+  const pageKey = pageUrl.split("#")[0];
   if (
     activeFixSession &&
-    (activeFixSession.relPrefix !== relPrefix || activeFixSession.domain !== domainNorm)
+    (activeFixSession.relPrefix !== relPrefix ||
+      activeFixSession.domain !== domainNorm ||
+      activeFixSession.pageKey !== pageKey)
   ) {
+    await localSink.flushQueue();
     localSink.clearSession();
     activeFixSession = null;
   }
-  await localSink.loadSettings();
   if (!localSink.getSessionId()) {
     const started = await localSink.startSession({
       gameName,
@@ -333,9 +451,51 @@ async function ensureFixSession(settings, pageUrl) {
       referer: normalizeGameDomainUrl(settings.domain),
       gameUrl: settings.domain
     });
-    activeFixSession = { relPrefix, gameName, domain: settings.domain, pageUrl };
+    activeFixSession = { relPrefix, gameName, domain: settings.domain, pageUrl, pageKey };
     console.log("[fix_game_resources] 本地会话:", started.sessionId, relPrefix);
   }
+}
+
+/**
+ * 确保 CDN / 游戏名与当前页一致；manifest 未就绪时 ready=false，禁止用旧配置下载
+ */
+async function ensureSettingsForPage(pageUrl) {
+  const pageKey = pageUrl.split("#")[0];
+  if (!pageKey.startsWith("http")) {
+    return { settings: await getSettings(), error: "无效页面 URL", ready: false };
+  }
+
+  return enqueueSettingsSync(async () => {
+    const slugFromUrl = parseGameNameFromUrl(pageUrl);
+    const prev = await getSettings();
+    const needForce =
+      pageKey !== lastSyncedPageKey ||
+      !(prev.domain || "").trim() ||
+      (!!slugFromUrl && !!prev.gameName && slugFromUrl !== prev.gameName);
+
+    const sync = await syncSettingsFromPageUrl(pageUrl, { force: needForce });
+    const settings = sync.settings;
+
+    if (sync.error) {
+      return { settings, error: sync.error, ready: false };
+    }
+    if (!(settings.domain || "").trim()) {
+      return {
+        settings,
+        error: "assets-manifest.json 中缺少 gameUrl",
+        ready: false
+      };
+    }
+    const manifestGame = (settings.gameName || "").trim();
+    if (slugFromUrl && manifestGame && slugFromUrl !== manifestGame) {
+      return {
+        settings,
+        error: `manifest 游戏名 (${manifestGame}) 与当前页 (${slugFromUrl}) 不一致`,
+        ready: false
+      };
+    }
+    return { settings, error: null, ready: true };
+  });
 }
 
 async function readManifestForMerge(pageUrl) {
@@ -354,6 +514,7 @@ async function saveManifestMerged(settings, pageUrl, merged) {
   if (localSink.isEnabled()) {
     await localSink.loadSettings();
     await ensureFixSession(settings, pageUrl);
+    await localSink.flushQueue();
     await localSink.saveText(MANIFEST_REL_PATH, json, { overwrite: true });
     return;
   }
@@ -403,13 +564,12 @@ async function saveOneResource(settings, pageUrl, encodedRel) {
 
   if (localSink.isEnabled()) {
     await ensureFixSession(settings, pageUrl);
-    localSink.enqueueIngest({
+    await localSink.flushQueue();
+    const result = await localSink.ingestImmediate({
       sourceUrl,
       relPath,
       overwrite: true
     });
-    const data = await localSink.flushQueue();
-    const result = (data?.results || []).find((r) => r.relPath === relPath) || data?.results?.slice(-1)[0];
     if (result?.status === "failed") {
       throw new Error(result.error || "ingest failed");
     }
@@ -470,20 +630,32 @@ async function fetchAndSaveChrome(sourceUrl, filename) {
 }
 
 async function autoDownloadOne(tabId, pageUrl, entry) {
-  await syncSettingsFromPageUrl(pageUrl);
-  const settings = await getSettings();
-  const domain = (settings.domain || "").trim();
-  if (!domain) return;
+  return enqueueDownloadJob(async () => {
+    const { settings, error: syncError, ready } = await ensureSettingsForPage(pageUrl);
+    const domain = (settings.domain || "").trim();
+    if (!ready || !domain) {
+      const errMsg =
+        syncError ||
+        "manifest 未就绪（请确认在游戏目录页且 assets-manifest.json 可访问）";
+      console.warn("[fix_game_resources] 暂缓 404 下载:", entry.url, errMsg);
+      await appendFailed(tabId, {
+        url: entry.url,
+        relativePath: entry.relativePath,
+        error: errMsg
+      });
+      return;
+    }
 
-  try {
-    await saveOneResource(settings, pageUrl, entry.relativePath);
-  } catch (e) {
-    await appendFailed(tabId, {
-      url: entry.url,
-      relativePath: entry.relativePath,
-      error: e && e.message ? e.message : String(e)
-    });
-  }
+    try {
+      await saveOneResource(settings, pageUrl, entry.relativePath);
+    } catch (e) {
+      await appendFailed(tabId, {
+        url: entry.url,
+        relativePath: entry.relativePath,
+        error: e && e.message ? e.message : String(e)
+      });
+    }
+  });
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
@@ -493,6 +665,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     localSink.clearSession();
     activeFixSession = null;
     lastSyncedPageKey = "";
+    lastSyncedGameSlug = "";
   }
   const data = await get404Storage();
   if (data[tabId]) {
@@ -541,6 +714,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         localSink.clearSession();
         activeFixSession = null;
         lastSyncedPageKey = "";
+        lastSyncedGameSlug = "";
         const sync = await syncSettingsFromPageUrl(pageUrl, { force: true });
         if (sync.error || !sync.settings?.domain) {
           sendResponse({
@@ -551,7 +725,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           });
           return;
         }
+        lastSyncedGameSlug = parseGameNameFromUrl(pageUrl) || sync.settings.gameName || "";
         await setListeningTabId(tabId);
+        notifySettingsSynced(sync);
         sendResponse({
           ok: true,
           sinkMode: localSink.isEnabled() ? "local-server" : "chrome-downloads",
@@ -573,6 +749,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         localSink.clearSession();
         activeFixSession = null;
         lastSyncedPageKey = "";
+        lastSyncedGameSlug = "";
         sendResponse({ ok: true });
       } catch (e) {
         sendResponse({ ok: false, error: (e && e.message) || String(e) });
@@ -712,21 +889,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         const downloaded = [];
         const failed = [];
-        for (const item of items) {
-          const rel = item.relativePath || item.path || "";
-          if (!rel) continue;
-          try {
-            const r = await saveOneResource(settings, pageUrl, rel);
-            downloaded.push(r);
-          } catch (e) {
-            const built = buildRemoteAndLocal(settings, pageUrl, rel);
-            failed.push({
-              url: built.sourceUrl,
-              relativePath: rel,
-              error: e && e.message ? e.message : String(e)
-            });
+        await enqueueDownloadJob(async () => {
+          const { settings: synced, error: syncError, ready } =
+            await ensureSettingsForPage(pageUrl);
+          const useSettings =
+            ready && (synced.domain || "").trim() ? synced : settings;
+          if (!ready || !(useSettings.domain || "").trim()) {
+            throw new Error(syncError || "无法同步游戏 CDN 配置（manifest 未就绪）");
           }
-        }
+          for (const item of items) {
+            const rel = item.relativePath || item.path || "";
+            if (!rel) continue;
+            try {
+              const r = await saveOneResource(useSettings, pageUrl, rel);
+              downloaded.push(r);
+            } catch (e) {
+              const built = buildRemoteAndLocal(useSettings, pageUrl, rel);
+              failed.push({
+                url: built.sourceUrl,
+                relativePath: rel,
+                error: e && e.message ? e.message : String(e)
+              });
+            }
+          }
+        });
         return { ok: true, downloaded, failed };
       } catch (e) {
         return { ok: false, error: e.message };

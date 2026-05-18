@@ -195,7 +195,16 @@ async function drainPending() {
   while (pendingBatch.length > 0) {
     const batch = pendingBatch.splice(0, BATCH_SIZE);
     const data = await ingestBatch(batch);
-    if (data?.results?.length) allResults.push(...data.results);
+    const results = data?.results;
+    if (!Array.isArray(results)) continue;
+    for (let i = 0; i < results.length; i++) {
+      const item = batch[i];
+      allResults.push({
+        ...results[i],
+        _sourceUrl: item?.sourceUrl || "",
+        relPath: results[i]?.relPath ?? item?.relPath
+      });
+    }
   }
   return { results: allResults };
 }
@@ -217,7 +226,6 @@ export async function readText(relPath) {
 
 export async function saveText(relPath, text, { overwrite = true } = {}) {
   if (!isEnabled()) return null;
-  await flushQueue();
   return ingestImmediate({
     relPath,
     body: text,

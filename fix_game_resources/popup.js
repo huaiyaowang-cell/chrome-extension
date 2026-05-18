@@ -440,6 +440,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
   applySettingsToForm(changes[STORAGE_SETTINGS].newValue);
 });
 
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== "SETTINGS_AUTO_SYNCED") return;
+  if (message.settings) applySettingsToForm(message.settings);
+  if (message.changed && message.settings?.gameName) {
+    showStatus(`已切换游戏，已从 manifest 同步: ${message.settings.gameName}`, "ok");
+    setTimeout(hideStatus, 2500);
+    void load404List();
+  } else if (message.error) {
+    showStatus("同步 manifest: " + message.error, "error");
+    setTimeout(hideStatus, 3000);
+  }
+});
+
 void (async () => {
   await loadSinkSettings();
   await loadSettings();
