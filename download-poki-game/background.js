@@ -30,8 +30,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sessionReady
       .then(() =>
         startMonitor(message.tabId, {
-          manualGameUrl: message.manualGameUrl || null,
-          manualResourceUrls: message.manualResourceUrls || [],
           sinkSettings: message.sinkSettings || null
         })
       )
@@ -64,23 +62,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
-  if (message?.type === "DOWNLOAD_MANUAL_RESOURCES") {
-    sessionReady
-      .then(() => downloadManualResources(message.tabId, message.urls))
-      .then((r) => sendResponse(r))
-      .catch((e) => sendResponse({ ok: false, error: e.message }));
-    return true;
-  }
   if (message?.type === "CAPTURE_HTML") {
     sessionReady
       .then(() => captureAndSaveHtml(message.tabId))
-      .then((r) => sendResponse({ ok: true, ...r }))
-      .catch((e) => sendResponse({ ok: false, error: e.message }));
-    return true;
-  }
-  if (message?.type === "DOWNLOAD_ASSET") {
-    sessionReady
-      .then(() => downloadExtraAsset(message.tabId, message.url, message.assetKey))
       .then((r) => sendResponse({ ok: true, ...r }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -534,7 +518,7 @@ async function processRequest(url, requestType) {
 /* ── Monitor lifecycle ─────────────────────────────────────── */
 
 async function startMonitor(tabId, options = {}) {
-  const { manualGameUrl, manualResourceUrls = [], sinkSettings = null } = options;
+  const { sinkSettings = null } = options;
 
   const pageInfo = await getPageInfoFromTab(tabId);
   if (!pageInfo?.pageUrl) throw new Error("无法读取页面信息。");
@@ -586,7 +570,7 @@ async function startMonitor(tabId, options = {}) {
       gameName,
       relPrefix: folder,
       pageUrl: pageInfo.pageUrl,
-      gameUrl: manualGameUrl && manualGameUrl.startsWith("http") ? manualGameUrl : ""
+      gameUrl: ""
     });
     activeSession.localSessionId = started.sessionId;
     console.log("[poki-dl] 本地服务会话:", started.sessionId, started.gameDir);
@@ -597,37 +581,12 @@ async function startMonitor(tabId, options = {}) {
 
   const dbgOk = await attachDebugger(tabId);
 
-  if (manualGameUrl && manualGameUrl.startsWith("http")) {
-    try {
-      const url = new URL(manualGameUrl);
-      activeSession.gameHost = url.host;
-      activeSession.gameUrl = manualGameUrl;
-      activeSession.gameBaseUrl = getBaseUrl(manualGameUrl);
-      console.log(`[poki-dl] 使用手动游戏地址: ${url.host}, base: ${activeSession.gameBaseUrl}`);
-      await flushRequestBuffer();
-    } catch (e) {
-      console.warn("[poki-dl] 手动游戏地址解析失败:", e.message);
-    }
-  }
-
-  if (!activeSession.gameHost) startGameframeDetection(tabId);
-
-  if (manualResourceUrls.length > 0) {
-    void downloadManualResources(tabId, manualResourceUrls);
-  }
+  startGameframeDetection(tabId);
 
   await persistSession();
   await chrome.storage.local.set({ lastGameInfo: { gameName, folder } });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
   await chrome.action.setBadgeText({ tabId, text: "ON" });
-
-  // 使用手动游戏地址时，资源请求往往已在之前完成，只有刷新页面才会再次发起请求。
-  // 延迟刷新，确保 session 已写入 storage（否则 SW 被终止后恢复时可能读不到 gameHost）
-  if (manualGameUrl && manualGameUrl.startsWith("http") && activeSession.gameHost) {
-    setTimeout(() => {
-      chrome.tabs.reload(tabId).catch((e) => console.warn("[poki-dl] 自动刷新失败:", e?.message));
-    }, 500);
-  }
 
   return {
     gameName,
@@ -928,8 +887,14 @@ function buildSdkStubContent() {
     gameLoadingFinished: _hideLoading,
     gameLoadingProgress: _pn,
     gameInteractive: _hideLoading,
-    gameplayStart: _pn,
-    gameplayStop: _pn,
+    gameplayStart: () => {
+      console.log("[poki-dl] gameplayStart");
+      return Promise.resolve();
+    },
+    gameplayStop: () => {
+      console.log("[poki-dl] gameplayStop");
+      return Promise.resolve();
+    },
     commercialBreak: _breakWithCb,
     rewardedBreak: _rewardedWithCb,
     measure: _pn,
@@ -1377,112 +1342,6 @@ function isTrackerUrl(url) {
   return TRACKER_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-/* ── Extra asset download ──────────────────────────────────── */
-
-async function downloadExtraAsset(tabId, url, assetKey) {
-  if (!url || !url.startsWith("http")) {
-    throw new Error("请输入有效的 URL 地址。");
-  }
-
-  let gameName, folder;
-  if (activeSession) {
-    gameName = activeSession.gameName;
-    folder = activeSession.folder;
-  } else {
-    const stored = await chrome.storage.local.get("lastGameInfo");
-    const info = stored.lastGameInfo;
-    if (!info?.gameName || !info?.folder) {
-      throw new Error("无游戏信息，请先开始监听并下载一次游戏。");
-    }
-    gameName = info.gameName;
-    folder = info.folder;
-  }
-
-  const ext = extractExtFromUrl(url);
-  const filename = `${gameName}_${assetKey}${ext}`;
-  const localPath = `__assets__/${filename}`;
-  const fullPath = `${folder}/${localPath}`;
-
-  await downloadUrl(url, fullPath, "extra-asset");
-
-  if (activeSession && !localSink.isEnabled()) {
-    upsertFile({
-      type: "extra-asset",
-      sourceUrl: url,
-      localPath,
-      status: "ok",
-      assetKey
-    });
-    activeSession.stats.downloaded += 1;
-    schedulePersist();
-    scheduleManifest();
-  } else if (activeSession) {
-    schedulePersist();
-    scheduleManifest();
-  }
-
-  console.log(`[poki-dl] extra asset downloaded: ${localPath}`);
-  return { localPath, filename };
-}
-
-/** 手动指定的静态资源 URL 列表，下载到游戏目录 */
-async function downloadManualResources(tabId, urls) {
-  const list = Array.isArray(urls) ? urls.filter((u) => u && String(u).startsWith("http")) : [];
-  if (list.length === 0) return { ok: true, downloaded: 0 };
-
-  let folder, gameName;
-  if (activeSession && activeSession.tabId === tabId) {
-    folder = activeSession.folder;
-    gameName = activeSession.gameName;
-  } else {
-    const stored = await chrome.storage.local.get("lastGameInfo");
-    const info = stored.lastGameInfo;
-    if (!info?.folder) throw new Error("无游戏目录，请先开始监听。");
-    folder = info.folder;
-    gameName = info.gameName || "poki-game";
-  }
-
-  let downloaded = 0;
-  for (let i = 0; i < list.length; i++) {
-    const url = list[i];
-    const localPath = urlToLocalPath(url);
-    if (activeSession && activeSession.downloadedLocalPaths.has(localPath)) {
-      activeSession.seenUrls.add(url);
-      continue;
-    }
-    try {
-      await downloadUrl(url, `${folder}/${localPath}`, "manual");
-      downloaded += 1;
-      if (activeSession) {
-        activeSession.seenUrls.add(url);
-        if (!localSink.isEnabled()) {
-          activeSession.downloadedLocalPaths.add(localPath);
-          activeSession.stats.downloaded += 1;
-          upsertFile({ type: "asset", sourceUrl: url, localPath, status: "ok", requestType: "manual" });
-        }
-        schedulePersist();
-        scheduleManifest();
-        updateBadgeCount();
-      }
-    } catch (err) {
-      console.warn(`[poki-dl] manual resource failed: ${url}`, err.message);
-      if (activeSession && !localSink.isEnabled()) {
-        activeSession.stats.failed += 1;
-        upsertFile({
-          type: "asset",
-          sourceUrl: url,
-          localPath,
-          status: "failed",
-          requestType: "manual",
-          error: String(err?.message || err)
-        });
-      }
-    }
-  }
-  console.log(`[poki-dl] manual resources: ${downloaded}/${list.length} downloaded`);
-  return { ok: true, downloaded, total: list.length };
-}
-
 /** 导出配置为 JSON 并下载到游戏目录（相对于浏览器默认下载目录） */
 async function exportConfig(config, folder) {
   if (!folder) {
@@ -1494,9 +1353,7 @@ async function exportConfig(config, folder) {
   const json = JSON.stringify(
     {
       gameName: config.gameName,
-      folder: config.folder,
-      manualGameUrl: config.manualGameUrl || null,
-      manualResourceUrls: config.manualResourceUrls || []
+      folder: config.folder
     },
     null,
     2

@@ -2,9 +2,6 @@ const startBtn = document.getElementById("startBtn");
 const captureBtn = document.getElementById("captureBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
-const manualGameUrlEl = document.getElementById("manualGameUrl");
-const manualResourceListEl = document.getElementById("manualResourceList");
-const addResourceBtn = document.getElementById("addResourceBtn");
 const exportConfigBtn = document.getElementById("exportConfigBtn");
 const importConfigBtn = document.getElementById("importConfigBtn");
 const importFileEl = document.getElementById("importFile");
@@ -14,7 +11,6 @@ const sinkServerUrlEl = document.getElementById("sinkServerUrl");
 const sinkOutputRootEl = document.getElementById("sinkOutputRoot");
 const testSinkBtn = document.getElementById("testSinkBtn");
 
-const POPUP_CONFIG_KEY = "popupConfig";
 const SINK_SETTINGS_KEY = "pokiSinkSettings";
 const DEFAULT_SERVER_URL = "http://127.0.0.1:22222";
 
@@ -35,8 +31,6 @@ async function getActiveTab() {
 
 function updateButtons(state) {
   const isListening = state === "listening";
-  const isIdle = state === "idle" || state === "stopped";
-
   startBtn.textContent = isListening ? "监听中..." : "开始监听当前标签页";
   startBtn.disabled = isListening;
   captureBtn.disabled = !isListening;
@@ -101,13 +95,6 @@ async function refreshStatus() {
   }
 }
 
-function getManualResourceUrls() {
-  const inputs = manualResourceListEl.querySelectorAll(".resource-row input");
-  return Array.from(inputs)
-    .map((el) => el.value.trim())
-    .filter(Boolean);
-}
-
 function getSinkSettings() {
   return {
     enabled: !!useLocalSinkEl?.checked,
@@ -116,14 +103,8 @@ function getSinkSettings() {
   };
 }
 
-function savePopupConfig() {
-  const manualGameUrl = manualGameUrlEl.value.trim() || null;
-  const manualResourceUrls = getManualResourceUrls();
-  const sinkSettings = getSinkSettings();
-  return chrome.storage.local.set({
-    [POPUP_CONFIG_KEY]: { manualGameUrl, manualResourceUrls },
-    [SINK_SETTINGS_KEY]: sinkSettings
-  });
+function saveSinkSettings() {
+  return chrome.storage.local.set({ [SINK_SETTINGS_KEY]: getSinkSettings() });
 }
 
 async function loadSinkSettings() {
@@ -134,61 +115,13 @@ async function loadSinkSettings() {
   if (sinkOutputRootEl && sink.outputRoot) sinkOutputRootEl.value = sink.outputRoot;
 }
 
-async function loadPopupConfig() {
-  const stored = await chrome.storage.local.get(POPUP_CONFIG_KEY);
-  const config = stored[POPUP_CONFIG_KEY];
-  if (config) {
-    manualGameUrlEl.value = config.manualGameUrl || "";
-    manualResourceListEl.innerHTML = "";
-    const urls = Array.isArray(config.manualResourceUrls) ? config.manualResourceUrls : [];
-    if (urls.length === 0) addResourceRow();
-    else urls.forEach((u) => addResourceRow(typeof u === "string" ? u : ""));
-  } else {
-    if (manualResourceListEl.children.length === 0) addResourceRow();
-  }
-}
-
-function addResourceRow(value = "") {
-  const row = document.createElement("div");
-  row.className = "resource-row";
-  const input = document.createElement("input");
-  input.type = "text";
-  input.placeholder = "https://...";
-  input.value = value;
-  const removeBtn = document.createElement("button");
-  removeBtn.type = "button";
-  removeBtn.className = "secondary remove-btn";
-  removeBtn.textContent = "删除";
-  removeBtn.addEventListener("click", () => {
-    row.remove();
-    savePopupConfig();
-  });
-  row.appendChild(input);
-  row.appendChild(removeBtn);
-  manualResourceListEl.appendChild(row);
-}
-
-addResourceBtn.addEventListener("click", () => {
-  addResourceRow();
-  savePopupConfig();
-});
-
-manualGameUrlEl.addEventListener("blur", () => savePopupConfig());
-manualResourceListEl.addEventListener("blur", (e) => {
-  if (e.target.matches("input")) savePopupConfig();
-}, true);
-
-/* 初始化：从 storage 恢复配置，若无则至少一行 */
-void loadPopupConfig();
-void loadSinkSettings();
-
-if (useLocalSinkEl) useLocalSinkEl.addEventListener("change", () => savePopupConfig());
-if (sinkServerUrlEl) sinkServerUrlEl.addEventListener("blur", () => savePopupConfig());
-if (sinkOutputRootEl) sinkOutputRootEl.addEventListener("blur", () => savePopupConfig());
+if (useLocalSinkEl) useLocalSinkEl.addEventListener("change", () => void saveSinkSettings());
+if (sinkServerUrlEl) sinkServerUrlEl.addEventListener("blur", () => void saveSinkSettings());
+if (sinkOutputRootEl) sinkOutputRootEl.addEventListener("blur", () => void saveSinkSettings());
 
 async function probeLocalServer() {
   const sink = getSinkSettings();
-  await savePopupConfig();
+  await saveSinkSettings();
   if (!sink.enabled) {
     return { ok: true, message: "已关闭本地服务，将使用 Chrome 下载" };
   }
@@ -197,15 +130,9 @@ async function probeLocalServer() {
   const data = await res.json();
   if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
   if (!sink.outputRoot) {
-    return {
-      ok: true,
-      message: `服务正常（${base}）\n请填写「输出根目录」`
-    };
+    return { ok: true, message: `服务正常（${base}）\n请填写「输出根目录」` };
   }
-  return {
-    ok: true,
-    message: `本地服务正常\n${base}\n输出: ${sink.outputRoot}`
-  };
+  return { ok: true, message: `本地服务正常\n${base}\n输出: ${sink.outputRoot}` };
 }
 
 if (testSinkBtn) {
@@ -213,7 +140,7 @@ if (testSinkBtn) {
     testSinkBtn.disabled = true;
     testSinkBtn.textContent = "检测中...";
     try {
-      savePopupConfig();
+      await saveSinkSettings();
       const result = await probeLocalServer();
       setStatus(result.message || "本地服务正常");
     } catch (e) {
@@ -229,11 +156,11 @@ if (testSinkBtn) {
 }
 
 clearConfigBtn.addEventListener("click", () => {
-  manualGameUrlEl.value = "";
-  manualResourceListEl.innerHTML = "";
-  addResourceRow();
-  savePopupConfig();
-  setStatus("配置已清空。");
+  if (sinkServerUrlEl) sinkServerUrlEl.value = DEFAULT_SERVER_URL;
+  if (sinkOutputRootEl) sinkOutputRootEl.value = "";
+  if (useLocalSinkEl) useLocalSinkEl.checked = true;
+  void saveSinkSettings();
+  setStatus("本地服务配置已重置。");
 });
 
 startBtn.addEventListener("click", async () => {
@@ -244,10 +171,7 @@ startBtn.addEventListener("click", async () => {
     const tab = await getActiveTab();
     if (!tab?.id) throw new Error("未找到当前标签页。");
 
-    const manualGameUrl = manualGameUrlEl.value.trim() || null;
-    const manualResourceUrls = getManualResourceUrls();
-
-    savePopupConfig();
+    await saveSinkSettings();
     const sinkSettings = getSinkSettings();
     if (sinkSettings.enabled && !sinkSettings.outputRoot) {
       throw new Error("请填写「输出根目录」后再开始监听。");
@@ -256,32 +180,20 @@ startBtn.addEventListener("click", async () => {
     const result = await chrome.runtime.sendMessage({
       type: "START_MONITOR",
       tabId: tab.id,
-      manualGameUrl,
-      manualResourceUrls,
       sinkSettings
     });
 
     if (!result) throw new Error("后台无响应，请在 chrome://extensions/ 重新加载插件。");
     if (!result.ok) throw new Error(result.error || "开启监听失败。");
 
-    const usedManualUrl = !!manualGameUrl && manualGameUrl.startsWith("http");
     let sinkLine = "\n写盘: Chrome 下载（可能弹窗，建议启用本地服务）";
     if (result.sinkMode === "local-server") {
       sinkLine = `\n写盘: 本地服务 → ${sinkSettings.outputRoot}/${result.folder}/`;
     }
-    let statusMsg = usedManualUrl
-      ? `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/${sinkLine}\n\n已使用游戏地址，页面将自动刷新，资源会通过 CDP 抓取并保存。`
-      : `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/${sinkLine}\n\n请现在刷新页面，进入游戏。\n检测到游戏后资源将自动下载。\n\n若刷新后仍无下载：可填写上方「游戏地址」和「指定下载的静态资源」后重新开始监听。`;
-    if (usedManualUrl) {
-      try {
-        const port = chrome.runtime.connect({ name: "keepalive" });
-        window._keepAlivePort = port;
-        statusMsg += "\n\n请勿关闭本弹窗，直至控制台出现多行「CDP 保存」后再关闭。";
-      } catch (_) {}
-    }
-    setStatus(statusMsg);
+    setStatus(
+      `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/${sinkLine}\n\n请现在刷新页面，进入游戏。\n检测到游戏后资源将自动下载。`
+    );
     updateButtons("listening");
-    savePopupConfig();
   } catch (error) {
     setError(`错误: ${error.message}`);
     updateButtons("idle");
@@ -341,44 +253,6 @@ stopBtn.addEventListener("click", async () => {
   }
 });
 
-/* ── Asset download buttons ── */
-
-const assetButtons = [
-  { btn: "dlGameIcon", input: "gameIconUrl", key: "game_icon" },
-  { btn: "dlThumbnailVideo", input: "thumbnailVideoUrl", key: "thumbnail_video" },
-  { btn: "dlGameCover", input: "gameCoverUrl", key: "game_cover" }
-];
-
-for (const { btn, input, key } of assetButtons) {
-  document.getElementById(btn).addEventListener("click", async () => {
-    const url = document.getElementById(input).value.trim();
-    if (!url) return;
-    const button = document.getElementById(btn);
-    button.disabled = true;
-    button.textContent = "...";
-    try {
-      const tab = await getActiveTab();
-      if (!tab?.id) throw new Error("未找到标签页");
-      const result = await chrome.runtime.sendMessage({
-        type: "DOWNLOAD_ASSET",
-        tabId: tab.id,
-        url,
-        assetKey: key
-      });
-      if (!result) throw new Error("后台无响应");
-      if (!result.ok) throw new Error(result.error || "下载失败");
-      button.textContent = "✓";
-      setTimeout(() => { button.textContent = "下载"; button.disabled = false; }, 1500);
-    } catch (e) {
-      button.textContent = "✗";
-      setError(`资源下载失败: ${e.message}`);
-      setTimeout(() => { button.textContent = "下载"; button.disabled = false; }, 2000);
-    }
-  });
-}
-
-/* ── 配置导出 / 导入 ── */
-
 exportConfigBtn.addEventListener("click", async () => {
   try {
     const tab = await getActiveTab();
@@ -392,16 +266,9 @@ exportConfigBtn.addEventListener("click", async () => {
     const gameName = statusResult.gameName || "poki-game";
     if (!folder) throw new Error("无游戏目录信息，请先开始监听一次。");
 
-    const config = {
-      gameName,
-      folder,
-      manualGameUrl: manualGameUrlEl.value.trim() || null,
-      manualResourceUrls: getManualResourceUrls()
-    };
-
     const result = await chrome.runtime.sendMessage({
       type: "EXPORT_CONFIG",
-      config,
+      config: { gameName, folder },
       folder
     });
     if (!result?.ok) throw new Error(result?.error || "导出失败。");
@@ -418,26 +285,19 @@ importFileEl.addEventListener("change", async (e) => {
   if (!file) return;
   e.target.value = "";
   try {
-    const text = await file.text();
-    const config = JSON.parse(text);
-    if (config.manualGameUrl != null) manualGameUrlEl.value = config.manualGameUrl || "";
-    const urls = Array.isArray(config.manualResourceUrls) ? config.manualResourceUrls : [];
-    manualResourceListEl.innerHTML = "";
-    if (urls.length === 0) addResourceRow();
-    else urls.forEach((u) => addResourceRow(typeof u === "string" ? u : ""));
-    setStatus(`已导入配置，游戏: ${config.gameName || "-"}，${urls.length} 个资源地址。`);
+    const config = JSON.parse(await file.text());
+    setStatus(`已导入配置，游戏: ${config.gameName || "-"}，目录: ${config.folder || "-"}`);
   } catch (err) {
     setError(`导入失败: ${err.message}`);
   }
 });
 
-/* ── Polling ── */
+void loadSinkSettings();
+void refreshStatus();
 
 let pollTimer = null;
 function startPolling() {
   if (pollTimer) return;
   pollTimer = setInterval(() => void refreshStatus(), 3000);
 }
-
-void refreshStatus();
 startPolling();

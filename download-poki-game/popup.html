@@ -93,55 +93,6 @@
         color: #6b7280;
       }
 
-      .asset-section {
-        margin-top: 12px;
-        border-top: 1px solid #e5e7eb;
-        padding-top: 10px;
-      }
-
-      .asset-section h2 {
-        font-size: 13px;
-        margin: 0 0 8px;
-        color: #374151;
-      }
-
-      .asset-row {
-        display: flex;
-        gap: 6px;
-        align-items: center;
-        margin-bottom: 6px;
-      }
-
-      .asset-row label {
-        font-size: 11px;
-        color: #6b7280;
-        white-space: nowrap;
-        min-width: 72px;
-      }
-
-      .asset-row input {
-        flex: 1;
-        min-width: 0;
-        border: 1px solid #d1d5db;
-        border-radius: 5px;
-        padding: 5px 7px;
-        font-size: 11px;
-        color: #111827;
-        outline: none;
-      }
-
-      .asset-row input:focus {
-        border-color: #2563eb;
-      }
-
-      .asset-row button {
-        width: auto;
-        padding: 5px 10px;
-        font-size: 11px;
-        border-radius: 5px;
-        flex-shrink: 0;
-      }
-
       .config-section {
         margin-top: 12px;
         border-top: 1px solid #e5e7eb;
@@ -200,37 +151,6 @@
         font-size: 10px;
       }
 
-      .resource-row {
-        display: flex;
-        gap: 6px;
-        align-items: center;
-        margin-bottom: 6px;
-      }
-
-      .resource-row input {
-        flex: 1;
-        min-width: 0;
-        border: 1px solid #d1d5db;
-        border-radius: 5px;
-        padding: 5px 7px;
-        font-size: 11px;
-      }
-
-      .resource-row .remove-btn {
-        width: auto;
-        padding: 5px 8px;
-        font-size: 11px;
-        flex-shrink: 0;
-        background: #fecaca;
-        color: #b91c1c;
-      }
-
-      .add-btn {
-        width: 100%;
-        margin-top: 4px;
-        font-size: 12px;
-      }
-
       .config-actions {
         display: flex;
         gap: 8px;
@@ -257,7 +177,7 @@
       <h1>Poki 游戏下载器</h1>
       <button type="button" id="clearConfigBtn" class="secondary clear-config-btn">清空配置</button>
     </div>
-    <p>先开启监听，再刷新页面进入游戏。<br/>检测到游戏后资源自动下载。<br/>游戏加载完成后点「生成 HTML」或直接停止。<br/><strong>若仍无下载</strong>：填写「游戏地址」或「指定下载的静态资源」后重新开始监听。</p>
+    <p>先开启监听，再刷新页面进入游戏。<br/>检测到游戏后资源自动下载。<br/>游戏加载完成后点「生成 HTML」或直接停止。</p>
 
     <div class="config-section">
       <h2>本地写盘服务</h2>
@@ -273,42 +193,11 @@
       <button type="button" id="testSinkBtn" class="secondary" style="margin-top:8px">检测本地服务</button>
     </div>
 
-    <div class="config-section">
-      <h2>游戏地址（可选）</h2>
-      <p class="config-desc">即 id=gameframe 的 iframe 的 src，填写后直接使用，不再从 DOM 检测。</p>
-      <input type="text" id="manualGameUrl" class="full-width" placeholder="https://xxx.gdn.poki.com/xxx/index.html" />
-    </div>
-
-    <div class="config-section">
-      <h2>指定下载的静态资源</h2>
-      <p class="config-desc">可添加多个 URL，开始监听后会按列表下载。</p>
-      <div id="manualResourceList"></div>
-      <button type="button" id="addResourceBtn" class="secondary add-btn">➕ 添加一个地址</button>
-    </div>
 
     <button id="startBtn">开始监听当前标签页</button>
     <button id="captureBtn" class="secondary" disabled>生成 HTML（游戏加载后点）</button>
     <button id="stopBtn" class="secondary" disabled>停止监听并写入清单</button>
     <div id="status" class="status"></div>
-
-    <div class="asset-section">
-      <h2>附加资源下载</h2>
-      <div class="asset-row">
-        <label>游戏图标</label>
-        <input type="text" id="gameIconUrl" placeholder="game_icon URL" />
-        <button class="secondary" data-asset="game_icon" id="dlGameIcon">下载</button>
-      </div>
-      <div class="asset-row">
-        <label>预览视频</label>
-        <input type="text" id="thumbnailVideoUrl" placeholder="thumbnail_video URL" />
-        <button class="secondary" data-asset="thumbnail_video" id="dlThumbnailVideo">下载</button>
-      </div>
-      <div class="asset-row">
-        <label>游戏封面</label>
-        <input type="text" id="gameCoverUrl" placeholder="game_cover URL" />
-        <button class="secondary" data-asset="game_cover" id="dlGameCover">下载</button>
-      </div>
-    </div>
 
     <div class="config-section">
       <h2>配置</h2>
