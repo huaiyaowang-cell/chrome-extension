@@ -73,3 +73,6 @@ cd tools/poki-dl-server && npm start
 
 > **本地服务模式**：资源写到 `{输出根目录}/downloaded-games/<游戏名>/`，不经过 Chrome 下载，无弹窗。  
 > **回退模式**（取消勾选本地服务）：仍使用 `chrome.downloads`，需关闭 Chrome「下载前询问保存位置」，并将默认下载目录设为输出根目录。
+
+分支版本：
+craw-with-local-server：本地服务器版本
