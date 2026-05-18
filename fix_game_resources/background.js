@@ -34,6 +34,31 @@ let downloadQueue = Promise.resolve();
 /** 串行化 manifest 同步（与 404 下载队列配合，避免竞态） */
 let settingsSyncChain = Promise.resolve();
 
+/** 同一游戏+相对路径的 404 补全合并为一次（刷新连发时避免排队压垮） */
+/** @type {Map<string, Promise<void>>} */
+const inflight404ByKey = new Map();
+
+function normalize404Rel(encodedRel) {
+  const rel = String(encodedRel || "").replace(/^\//, "");
+  try {
+    return decodeURIComponent(rel);
+  } catch {
+    return rel;
+  }
+}
+
+function make404DownloadKey(pageUrl, encodedRel, gameName = "") {
+  const slug =
+    sanitizeName(gameName) ||
+    sanitizeName(parseGameNameFromUrl(pageUrl)) ||
+    "unknown";
+  return `${slug}|${normalize404Rel(encodedRel)}`;
+}
+
+function clearInflight404Keys() {
+  inflight404ByKey.clear();
+}
+
 function enqueueDownloadJob(fn) {
   const job = downloadQueue.then(() => fn());
   downloadQueue = job.catch(() => {});
@@ -264,6 +289,7 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
       }
       localSink.clearSession();
       activeFixSession = null;
+      clearInflight404Keys();
     }
     lastSyncedPageKey = pageKey;
     if (valuesChanged) {
@@ -309,6 +335,7 @@ async function runSyncFromTab(tabId, pageUrl, options = {}) {
       } catch {
         /* 上一游戏遗留下载失败不阻塞切换 */
       }
+      clearInflight404Keys();
       await reset404ListForTab(tabId, pageUrl);
       console.log("[fix_game_resources] 已切换游戏，404 列表已清空:", gameSlug);
     }
@@ -583,6 +610,28 @@ async function saveOneResource(settings, pageUrl, encodedRel) {
   const sessionOpts = await ensureFixSession(settings, pageUrl);
   if (sessionOpts) {
     await localSink.flushQueue();
+    if (await localSink.fileExists(relPath)) {
+      try {
+        await appendToAssetsManifest(settings, pageUrl, {
+          type: "asset",
+          sourceUrl,
+          localPath: relPath,
+          status: "ok",
+          requestType: "404-fix",
+          fixedAt: new Date().toISOString(),
+          skipped: true
+        });
+      } catch (e) {
+        console.warn("[fix_game_resources] 写入 manifest:", e.message);
+      }
+      return {
+        sourceUrl,
+        relativePath: encodedRel,
+        relPath,
+        status: "skipped",
+        reason: "exists"
+      };
+    }
     const result = await localSink.ingestWithSessionRecovery(
       { sourceUrl, relPath, overwrite: true },
       sessionOpts
@@ -647,7 +696,13 @@ async function fetchAndSaveChrome(sourceUrl, filename) {
 }
 
 async function autoDownloadOne(tabId, pageUrl, entry) {
-  return enqueueDownloadJob(async () => {
+  const key = make404DownloadKey(pageUrl, entry.relativePath);
+  const existing = inflight404ByKey.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const task = enqueueDownloadJob(async () => {
     const { settings, error: syncError, ready } = await ensureSettingsForPage(pageUrl);
     const domain = (settings.domain || "").trim();
     if (!ready || !domain) {
@@ -671,8 +726,20 @@ async function autoDownloadOne(tabId, pageUrl, entry) {
         relativePath: entry.relativePath,
         error: e && e.message ? e.message : String(e)
       });
+      throw e;
     }
-  });
+  })
+    .catch(() => {
+      /* 已在上方 appendFailed */
+    })
+    .finally(() => {
+      if (inflight404ByKey.get(key) === task) {
+        inflight404ByKey.delete(key);
+      }
+    });
+
+  inflight404ByKey.set(key, task);
+  return task;
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
@@ -683,6 +750,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     activeFixSession = null;
     lastSyncedPageKey = "";
     lastSyncedGameSlug = "";
+    clearInflight404Keys();
   }
   const data = await get404Storage();
   if (data[tabId]) {
@@ -733,6 +801,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         activeFixSession = null;
         lastSyncedPageKey = "";
         lastSyncedGameSlug = "";
+        clearInflight404Keys();
         const sync = await syncSettingsFromPageUrl(pageUrl, { force: true });
         if (sync.error || !sync.settings?.domain) {
           sendResponse({
@@ -769,6 +838,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         activeFixSession = null;
         lastSyncedPageKey = "";
         lastSyncedGameSlug = "";
+        clearInflight404Keys();
         sendResponse({ ok: true });
       } catch (e) {
         sendResponse({ ok: false, error: (e && e.message) || String(e) });

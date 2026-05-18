@@ -30,6 +30,10 @@ let jobSeq = 0;
 const jobQueue = [];
 let activeDownloads = 0;
 
+/** 同 session 同路径的并发下载合并为一次 */
+/** @type {Map<string, Promise<object>>} */
+const pathDownloadInflight = new Map();
+
 /**
  * @typedef {object} Session
  * @property {string} sessionId
@@ -281,13 +285,22 @@ async function runJob(job) {
  */
 
 function enqueueDownload(session, sourceUrl, absPath) {
-  return new Promise((resolve) => {
+  const key = `${session.sessionId}\0${absPath}`;
+  const existing = pathDownloadInflight.get(key);
+  if (existing) return existing;
+
+  const promise = new Promise((resolve) => {
     const jobId = `j${++jobSeq}`;
     const job = { jobId, sessionId: session.sessionId, sourceUrl, absPath, resolve };
     jobs.set(jobId, job);
     jobQueue.push(job);
     pumpQueue();
+  }).finally(() => {
+    pathDownloadInflight.delete(key);
   });
+
+  pathDownloadInflight.set(key, promise);
+  return promise;
 }
 
 /**

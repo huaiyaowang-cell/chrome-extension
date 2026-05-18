@@ -274,6 +274,15 @@ export function flushQueue() {
   return flushChain;
 }
 
+export async function fileExists(relPath) {
+  if (!isEnabled() || !sessionId) return false;
+  const data = await api("/api/file/stat", {
+    method: "POST",
+    body: { sessionId, relPath }
+  });
+  return !!data?.exists;
+}
+
 export async function readText(relPath) {
   if (!isEnabled() || !sessionId) return null;
   const data = await api("/api/file/read", {
