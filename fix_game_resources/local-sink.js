@@ -35,6 +35,24 @@ export function isEnabled() {
   return !!settings?.enabled;
 }
 
+/** 是否配置为使用本地服务（读 storage，不依赖内存 settings 是否已 load） */
+export async function isLocalSinkRequested() {
+  const stored = await chrome.storage.local.get(SINK_SETTINGS_KEY);
+  const saved = stored[SINK_SETTINGS_KEY] || {};
+  if (saved.enabled === false) return false;
+  await loadSettings();
+  return settings?.enabled !== false;
+}
+
+function isSessionStaleError(e) {
+  const m = String(e?.message || e);
+  return (
+    m.includes("session not found") ||
+    m.includes("本地会话未建立") ||
+    m.includes("本地服务 HTTP 404")
+  );
+}
+
 async function refreshOutputRootFromServer() {
   const health = await healthCheck();
   const root = String(health.defaultOutputRoot || "").trim();
@@ -115,11 +133,31 @@ export async function pingServer(overrides = {}) {
 
 export async function ensureReady(overrides) {
   await loadSettings(overrides);
-  if (!settings.enabled) return { mode: "chrome-downloads" };
+  if (!(await isLocalSinkRequested())) return { mode: "chrome-downloads" };
+  if (!settings.outputRoot) {
+    try {
+      await refreshOutputRootFromServer();
+    } catch {
+      /* ignore */
+    }
+  }
   if (!settings.outputRoot) {
     throw new Error("请填写「输出根目录」");
   }
-  return pingServer(overrides);
+  await healthCheck();
+  return {
+    mode: "local-server",
+    serverUrl: settings.serverUrl,
+    outputRoot: settings.outputRoot
+  };
+}
+
+/** 扩展侧：本地模式已开启则必须写输出目录，不静默回退 chrome.downloads */
+export async function ensureLocalSinkReady(overrides = {}) {
+  if (!(await isLocalSinkRequested())) {
+    return { mode: "chrome-downloads" };
+  }
+  return ensureReady(overrides);
 }
 
 export async function startSession(opts) {
@@ -160,6 +198,28 @@ export async function ingestImmediate(item) {
     method: "POST",
     body: { sessionId, ...item }
   });
+}
+
+/**
+ * session 失效（服务重启、download-poki-game finishSession 等）时自动重建并重试
+ * @param {object} item
+ * @param {object} sessionOpts startSession 参数
+ */
+export async function ingestWithSessionRecovery(item, sessionOpts) {
+  if (!sessionOpts?.relPrefix) {
+    throw new Error("ingestWithSessionRecovery: 缺少 sessionOpts");
+  }
+  if (!sessionId) {
+    await startSession(sessionOpts);
+  }
+  try {
+    return await ingestImmediate(item);
+  } catch (e) {
+    if (!isSessionStaleError(e)) throw e;
+    clearSession();
+    await startSession(sessionOpts);
+    return ingestImmediate(item);
+  }
 }
 
 export async function ingestBatch(items) {
@@ -232,6 +292,19 @@ export async function saveText(relPath, text, { overwrite = true } = {}) {
     encoding: "utf8",
     overwrite
   });
+}
+
+export async function saveTextWithSessionRecovery(
+  relPath,
+  text,
+  sessionOpts,
+  { overwrite = true } = {}
+) {
+  await flushQueue();
+  return ingestWithSessionRecovery(
+    { relPath, body: text, encoding: "utf8", overwrite },
+    sessionOpts
+  );
 }
 
 export async function resumeSession(opts) {

@@ -14,6 +14,11 @@ const STORAGE_LISTENING = "fixGameResources_listeningTabId";
 /** @deprecated 旧版 storage 可能含 downloadDir，已忽略 */
 const LEGACY_DOWNLOAD_DIR = "downloaded-games";
 
+void localSink.loadSettings();
+chrome.runtime.onStartup.addListener(() => {
+  void localSink.loadSettings();
+});
+
 /** @type {{ relPrefix: string, gameName: string, domain: string, pageUrl: string, pageKey: string } | null} */
 let activeFixSession = null;
 
@@ -250,7 +255,7 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
       } catch {
         /* 队列中某项失败不影响重置会话 */
       }
-      if (localSink.isEnabled()) {
+      if (await localSink.isLocalSinkRequested()) {
         try {
           await localSink.flushQueue();
         } catch (e) {
@@ -419,20 +424,33 @@ function buildRemoteAndLocal(settings, pageUrl, encodedRel) {
   return { sourceUrl, relPath: relForFile, relPrefix, gameName, domain };
 }
 
-async function ensureFixSession(settings, pageUrl) {
-  if (!localSink.isEnabled()) return;
-  await localSink.loadSettings();
-  if (!localSink.getSettings()?.outputRoot) {
-    throw new Error("请填写「输出根目录」并确认本地服务可用");
-  }
+function buildFixSessionOpts(settings, pageUrl) {
   let gameName = (settings.gameName || "").trim();
   if (!gameName) gameName = parseGameNameFromUrl(pageUrl);
   if (!gameName) {
     throw new Error("无法确定游戏名（请确认在游戏目录页或 manifest 中有 gameName）");
   }
-  const relPrefix = gameName;
+  return {
+    gameName,
+    relPrefix: gameName,
+    pageUrl,
+    referer: normalizeGameDomainUrl(settings.domain),
+    gameUrl: settings.domain
+  };
+}
+
+/**
+ * @returns {Promise<object | null>} sessionOpts（本地模式）或 null（chrome 下载模式）
+ */
+async function ensureFixSession(settings, pageUrl) {
+  const ready = await localSink.ensureLocalSinkReady();
+  if (ready.mode !== "local-server") return null;
+
+  const sessionOpts = buildFixSessionOpts(settings, pageUrl);
+  const { gameName, relPrefix } = sessionOpts;
   const domainNorm = normalizeGameDomainUrl(settings.domain);
   const pageKey = pageUrl.split("#")[0];
+
   if (
     activeFixSession &&
     (activeFixSession.relPrefix !== relPrefix ||
@@ -443,17 +461,14 @@ async function ensureFixSession(settings, pageUrl) {
     localSink.clearSession();
     activeFixSession = null;
   }
+
   if (!localSink.getSessionId()) {
-    const started = await localSink.startSession({
-      gameName,
-      relPrefix,
-      pageUrl,
-      referer: normalizeGameDomainUrl(settings.domain),
-      gameUrl: settings.domain
-    });
+    const started = await localSink.startSession(sessionOpts);
     activeFixSession = { relPrefix, gameName, domain: settings.domain, pageUrl, pageKey };
-    console.log("[fix_game_resources] 本地会话:", started.sessionId, relPrefix);
+    console.log("[fix_game_resources] 本地会话:", started.sessionId, started.gameDir);
   }
+
+  return sessionOpts;
 }
 
 /**
@@ -511,11 +526,14 @@ async function saveManifestMerged(settings, pageUrl, merged) {
   const gameName = (settings.gameName || "").trim();
   if (!gameName) return;
 
-  if (localSink.isEnabled()) {
-    await localSink.loadSettings();
-    await ensureFixSession(settings, pageUrl);
-    await localSink.flushQueue();
-    await localSink.saveText(MANIFEST_REL_PATH, json, { overwrite: true });
+  const sessionOpts = await ensureFixSession(settings, pageUrl);
+  if (sessionOpts) {
+    await localSink.saveTextWithSessionRecovery(
+      MANIFEST_REL_PATH,
+      json,
+      sessionOpts,
+      { overwrite: true }
+    );
     return;
   }
 
@@ -557,19 +575,18 @@ async function appendToAssetsManifest(settings, pageUrl, fileEntry) {
 }
 
 /**
- * 保存单个 404 资源（本地服务或 chrome.downloads 回退）
+ * 保存单个 404 资源（本地服务写入输出目录；仅用户关闭本地服务时用 chrome.downloads）
  */
 async function saveOneResource(settings, pageUrl, encodedRel) {
   const { sourceUrl, relPath, relPrefix } = buildRemoteAndLocal(settings, pageUrl, encodedRel);
 
-  if (localSink.isEnabled()) {
-    await ensureFixSession(settings, pageUrl);
+  const sessionOpts = await ensureFixSession(settings, pageUrl);
+  if (sessionOpts) {
     await localSink.flushQueue();
-    const result = await localSink.ingestImmediate({
-      sourceUrl,
-      relPath,
-      overwrite: true
-    });
+    const result = await localSink.ingestWithSessionRecovery(
+      { sourceUrl, relPath, overwrite: true },
+      sessionOpts
+    );
     if (result?.status === "failed") {
       throw new Error(result.error || "ingest failed");
     }
@@ -708,8 +725,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
         await localSink.loadSettings(message.sinkSettings || {});
-        if (localSink.isEnabled()) {
-          await localSink.ensureReady(message.sinkSettings || {});
+        const sinkReady = await localSink.ensureLocalSinkReady(message.sinkSettings || {});
+        if (sinkReady.mode === "local-server") {
+          console.log("[fix_game_resources] 输出目录:", sinkReady.outputRoot);
         }
         localSink.clearSession();
         activeFixSession = null;
@@ -730,7 +748,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         notifySettingsSynced(sync);
         sendResponse({
           ok: true,
-          sinkMode: localSink.isEnabled() ? "local-server" : "chrome-downloads",
+          sinkMode:
+            (await localSink.isLocalSinkRequested()) ? "local-server" : "chrome-downloads",
           settings: sync.settings,
           settingsChanged: sync.changed
         });
@@ -764,10 +783,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const id = await getListeningTabId();
         await localSink.loadSettings();
         const settings = await getSettings();
+        const sinkMode = (await localSink.isLocalSinkRequested())
+          ? "local-server"
+          : "chrome-downloads";
         sendResponse({
           ok: true,
           listeningTabId: id,
-          sinkMode: localSink.isEnabled() ? "local-server" : "chrome-downloads",
+          sinkMode,
           settings
         });
       } catch (e) {
@@ -881,8 +903,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           gameName: String(gameName || "").trim()
         };
         await localSink.loadSettings(message.sinkSettings || {});
-        if (localSink.isEnabled()) {
-          await localSink.ensureReady(message.sinkSettings || {});
+        if (await localSink.isLocalSinkRequested()) {
+          await localSink.ensureLocalSinkReady(message.sinkSettings || {});
           localSink.clearSession();
           activeFixSession = null;
         }
