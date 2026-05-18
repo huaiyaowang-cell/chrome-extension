@@ -57,7 +57,7 @@ function renderStatus(result) {
     : "游戏检测: 等待中...";
   const htmlLine = result.htmlCaptured ? "index.html ✓" : "index.html ✗";
   const lines = [
-    "状态: 监听中",
+    "状态: 监听中（换游戏页 URL 会自动切换抓取）",
     `游戏: ${result.gameName}`,
     gameLine,
     `写盘: ${result.sinkMode === "local-server" ? "本地服务" : "Chrome 下载"}`,

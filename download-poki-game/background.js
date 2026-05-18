@@ -28,6 +28,7 @@ let gameframeTimer = null;
 let requestBuffer = [];
 let htmlAutoCaptureTimer = null;
 let htmlAutoCaptureInFlight = false;
+let portalRotateTimer = null;
 
 
 
@@ -131,8 +132,15 @@ chrome.webRequest.onCompleted.addListener(
   { urls: ["http://*/*", "https://*/*"] }
 );
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!activeSession || activeSession.tabId !== tabId) return;
+  if (activeSession.status !== "listening") return;
+
+  const pageUrl = changeInfo.url || tab?.url || "";
+  if (pageUrl.startsWith("http")) {
+    schedulePortalGameCheck(tabId, pageUrl);
+  }
+
   if (changeInfo.status === "loading") {
     debuggerAttached = false;
     pendingNetworkCaptures.clear();
@@ -449,7 +457,6 @@ async function detectGameframe(tabId) {
     const src = results?.find((r) => r.result)?.result || null;
     if (src) {
       console.log(`[poki-dl] gameframe detected: ${src.slice(0, 120)}`);
-      stopGameframeDetection();
       await onGameframeDetected(tabId, src);
     }
   } catch {
@@ -459,6 +466,22 @@ async function detectGameframe(tabId) {
 
 async function onGameframeDetected(tabId, src) {
   if (!activeSession || activeSession.tabId !== tabId) return;
+  if (activeSession.gameUrl === src) return;
+
+  if (activeSession.gameUrl && activeSession.gameUrl !== src) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const pageUrl = tab.url || "";
+      const slug = parsePortalGameSlug(pageUrl);
+      if (slug && sanitizeName(slug) !== sanitizeName(activeSession.portalSlug || activeSession.gameName)) {
+        await rotateToNewGame(tabId, pageUrl, slug);
+        if (!activeSession || activeSession.tabId !== tabId) return;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
   try {
     const url = new URL(src);
     activeSession.gameHost = url.host;
@@ -541,6 +564,164 @@ async function processRequest(url, requestType) {
   }
 }
 
+/* ── Portal /g/slug 切换 ─────────────────────────────────────── */
+
+function isPokiPortalUrl(pageUrl) {
+  try {
+    const u = new URL(pageUrl);
+    const host = u.hostname.replace(/^www\./, "");
+    return host === "poki.com" || host.endsWith(".poki.com");
+  } catch {
+    return false;
+  }
+}
+
+/** 从 Poki 门户 URL 解析游戏 slug，如 https://poki.com/en/g/beauty-salon */
+function parsePortalGameSlug(pageUrl) {
+  try {
+    const m = new URL(pageUrl).pathname.match(/\/g\/([^/?#]+)/i);
+    return m ? decodeURIComponent(m[1]) : "";
+  } catch {
+    return "";
+  }
+}
+
+function schedulePortalGameCheck(tabId, pageUrl) {
+  if (portalRotateTimer) clearTimeout(portalRotateTimer);
+  portalRotateTimer = setTimeout(() => {
+    portalRotateTimer = null;
+    void maybeRotateGameOnPortalUrl(tabId, pageUrl);
+  }, 450);
+}
+
+async function maybeRotateGameOnPortalUrl(tabId, pageUrl) {
+  if (!activeSession || activeSession.tabId !== tabId) return false;
+  if (activeSession.status !== "listening") return false;
+  if (!isPokiPortalUrl(pageUrl)) return false;
+
+  const slug = parsePortalGameSlug(pageUrl);
+  if (!slug) return false;
+
+  const nextName = sanitizeName(slug);
+  const currentSlug =
+    activeSession.portalSlug ||
+    parsePortalGameSlug(activeSession.pageUrl) ||
+    activeSession.gameName;
+  if (sanitizeName(currentSlug) === nextName) {
+    activeSession.pageUrl = pageUrl;
+    activeSession.portalSlug = slug;
+    return false;
+  }
+
+  await rotateToNewGame(tabId, pageUrl, slug);
+  return true;
+}
+
+/** 写入并结束当前游戏的 manifest / 本地会话（不解除标签页监听） */
+async function finalizeGameManifest() {
+  if (!activeSession) return;
+  try {
+    if (localSink.isEnabled()) {
+      await flushLocalSinkAndApply();
+    }
+    await writeManifest();
+    if (localSink.isEnabled() && activeSession.localSessionId) {
+      const manifest = buildManifestPayloadFromSession();
+      await localSink.finishSession(manifest);
+    }
+  } finally {
+    localSink.clearSession();
+    if (activeSession) activeSession.localSessionId = null;
+  }
+}
+
+async function beginNewGameCapture(tabId, pageUrl, slug) {
+  const gameName = sanitizeName(slug);
+  const folder = gameName;
+
+  await localSink.loadSettings();
+  const useLocalSink = localSink.isEnabled();
+
+  activeSession = {
+    tabId,
+    gameName,
+    folder,
+    portalSlug: slug,
+    pageUrl,
+    startedAt: new Date().toISOString(),
+    status: "listening",
+    gameHost: null,
+    gameUrl: null,
+    gameBaseUrl: null,
+    seenUrls: new Set(),
+    pending: new Set(),
+    downloadedLocalPaths: new Set(),
+    stats: { totalSeen: 0, downloaded: 0, failed: 0, skipped: 0 },
+    files: [],
+    htmlCaptured: false,
+    fontDataUrls: {},
+    portalInfo: null,
+    sinkMode: useLocalSink ? "local-server" : "chrome-downloads",
+    localSessionId: null
+  };
+
+  if (useLocalSink) {
+    const started = await localSink.startSession({
+      gameName,
+      relPrefix: folder,
+      pageUrl,
+      gameUrl: ""
+    });
+    activeSession.localSessionId = started.sessionId;
+    console.log("[poki-dl] 新游戏本地会话:", started.sessionId, started.gameDir);
+  }
+
+  if (await isIndexHtmlOnDisk()) {
+    activeSession.htmlCaptured = true;
+    console.log("[poki-dl] 新游戏目录已有 index.html，跳过自动生成");
+  }
+
+  await hydrateSessionFromManifestOnDisk();
+  void writeManifest();
+
+  requestBuffer = [];
+  networkHtmlCache.clear();
+  pendingNetworkCaptures.clear();
+  htmlAutoCaptureInFlight = false;
+
+  startGameframeDetection(tabId);
+  schedulePortalScrape(tabId);
+
+  await persistSession();
+  await chrome.storage.local.set({ lastGameInfo: { gameName, folder } });
+  try {
+    await chrome.action.setBadgeText({ tabId, text: "ON" });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function rotateToNewGame(tabId, pageUrl, slug) {
+  const prevName = activeSession?.gameName || "?";
+  const nextName = sanitizeName(slug);
+  console.log(`[poki-dl] 切换游戏: ${prevName} → ${nextName}`);
+
+  if (activeSession) {
+    activeSession.status = "stopped";
+    activeSession.stoppedAt = new Date().toISOString();
+    try {
+      await finalizeGameManifest();
+    } catch (e) {
+      console.warn("[poki-dl] 收尾上一游戏 manifest:", e.message);
+    }
+  }
+
+  stopGameframeDetection();
+  await beginNewGameCapture(tabId, pageUrl, slug);
+  debuggerAttached = false;
+  await attachDebugger(tabId);
+}
+
 /* ── Monitor lifecycle ─────────────────────────────────────── */
 
 async function startMonitor(tabId, options = {}) {
@@ -559,7 +740,8 @@ async function startMonitor(tabId, options = {}) {
     throw new Error("请在 Poki 游戏页面开启监听。");
   }
 
-  const gameName = sanitizeName(pageInfo.gameName || "poki-game");
+  const portalSlug = parsePortalGameSlug(pageInfo.pageUrl) || pageInfo.gameName || "";
+  const gameName = sanitizeName(portalSlug || pageInfo.gameName || "poki-game");
   const folder = gameName;
 
   localSink.clearSession();
@@ -570,6 +752,7 @@ async function startMonitor(tabId, options = {}) {
     tabId,
     gameName,
     folder,
+    portalSlug: portalSlug || gameName,
     pageUrl: pageInfo.pageUrl,
     startedAt: new Date().toISOString(),
     status: "listening",
@@ -581,12 +764,11 @@ async function startMonitor(tabId, options = {}) {
     /** 当前监听会话中已下载的本地路径，用于去重，避免同一文件重复下载 */
     downloadedLocalPaths: new Set(),
     stats: { totalSeen: 0, downloaded: 0, failed: 0, skipped: 0 },
-    sinkMode: "chrome-downloads",
-    localSessionId: null,
     files: [],
     htmlCaptured: false,
     /** 字体 data URL，用于生成 index 时内联，避免 file:// 下无法加载 */
     fontDataUrls: {},
+    portalInfo: null,
     sinkMode: useLocalSink ? "local-server" : "chrome-downloads",
     localSessionId: null
   };
@@ -769,19 +951,10 @@ async function stopMonitor(tabId) {
   }
 
   try {
-    if (localSink.isEnabled()) {
-      await flushLocalSinkAndApply();
-    }
-    await writeManifest();
-    if (localSink.isEnabled() && activeSession.localSessionId) {
-      const manifest = buildManifestPayloadFromSession();
-      await localSink.finishSession(manifest);
-    }
+    await finalizeGameManifest();
   } catch (e) {
     errors.push(`writeManifest: ${e.message}`);
   }
-
-  localSink.clearSession();
 
   const result = buildStatusPayload();
   if (errors.length > 0) result.warnings = errors;
@@ -1729,6 +1902,7 @@ function buildStatusPayload() {
     status: activeSession.status,
     gameName: activeSession.gameName,
     folder: activeSession.folder,
+    portalSlug: activeSession.portalSlug || "",
     stats: activeSession.stats,
     fileCount: activeSession.files.length,
     gameDetected: !!activeSession.gameHost,
@@ -1837,6 +2011,7 @@ async function persistSession() {
     tabId: activeSession.tabId,
     gameName: activeSession.gameName,
     folder: activeSession.folder,
+    portalSlug: activeSession.portalSlug || "",
     pageUrl: activeSession.pageUrl,
     startedAt: activeSession.startedAt,
     status: activeSession.status,

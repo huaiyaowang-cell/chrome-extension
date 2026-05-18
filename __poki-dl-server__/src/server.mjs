@@ -45,8 +45,52 @@ let activeDownloads = 0;
  * @property {number} failed
  */
 
+const LOG_URL_MAX = Number(process.env.POKI_DL_LOG_URL_MAX || 96);
+const LOG_INGEST = process.env.POKI_DL_LOG_INGEST !== "0";
+
 function log(...args) {
   console.log(`[poki-dl-server]`, ...args);
+}
+
+function truncateUrl(url, max = LOG_URL_MAX) {
+  if (!url) return "";
+  const s = String(url);
+  return s.length <= max ? s : `${s.slice(0, max)}…`;
+}
+
+function formatBytes(n) {
+  if (n == null || !Number.isFinite(n)) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+/**
+ * @param {Session} session
+ * @param {string} sourceUrl
+ * @param {string} absPath
+ * @param {object} result
+ */
+function logIngestResult(session, sourceUrl, absPath, result) {
+  if (!LOG_INGEST) return;
+  const status = String(result.status || "?").toUpperCase();
+  const rel = result.relPath || path.relative(session.gameDir, absPath);
+  const size = formatBytes(result.bytes);
+  const line = [
+    status.padEnd(7),
+    rel,
+    "→",
+    absPath,
+    size ? `(${size})` : "",
+    sourceUrl ? `<- ${truncateUrl(sourceUrl)}` : "[inline body]"
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const extra = [];
+  if (result.reason) extra.push(`reason=${result.reason}`);
+  if (result.wrote) extra.push(`wrote=${result.wrote}`);
+  if (result.error) extra.push(`error=${result.error}`);
+  log(extra.length ? `${line} | ${extra.join(" ")}` : line);
 }
 
 function json(res, status, body) {
@@ -252,39 +296,56 @@ function enqueueDownload(session, sourceUrl, absPath) {
  */
 async function ingestOne(session, item) {
   const { relPath: safeRel, abs } = safeResolve(session.gameDir, item.relPath);
+  const sourceUrl = item.sourceUrl && String(item.sourceUrl).startsWith("http")
+    ? String(item.sourceUrl)
+    : "";
+  let result;
 
   if (item.body != null && item.body !== "") {
     const enc = item.encoding === "base64" ? "base64" : "utf8";
     const overwrite = !!item.overwrite;
     if (!overwrite && (await fileExists(abs))) {
       session.skipped += 1;
-      return { relPath: safeRel, status: "skipped", reason: "exists" };
+      const st = await fs.stat(abs).catch(() => null);
+      result = {
+        relPath: safeRel,
+        status: "skipped",
+        reason: "exists",
+        bytes: st?.size
+      };
+    } else {
+      await writeBody(abs, item.body, enc);
+      session.downloaded += 1;
+      const st = await fs.stat(abs);
+      result = {
+        relPath: safeRel,
+        status: "ok",
+        bytes: st.size,
+        wrote: overwrite ? "body-overwrite" : "body"
+      };
     }
-    await writeBody(abs, item.body, enc);
-    session.downloaded += 1;
-    const st = await fs.stat(abs);
-    return {
-      relPath: safeRel,
-      status: "ok",
-      bytes: st.size,
-      wrote: overwrite ? "body-overwrite" : "body"
-    };
-  }
-
-  if (!item.sourceUrl || !item.sourceUrl.startsWith("http")) {
+  } else if (!sourceUrl) {
     session.failed += 1;
-    return { relPath: safeRel, status: "failed", error: "missing sourceUrl" };
+    result = { relPath: safeRel, status: "failed", error: "missing sourceUrl" };
+  } else {
+    const overwrite = !!item.overwrite;
+    if (!overwrite && (await fileExists(abs))) {
+      session.skipped += 1;
+      const st = await fs.stat(abs);
+      result = {
+        relPath: safeRel,
+        status: "skipped",
+        reason: "exists",
+        bytes: st.size
+      };
+    } else {
+      const dl = await enqueueDownload(session, sourceUrl, abs);
+      result = { relPath: safeRel, ...dl };
+    }
   }
 
-  const overwrite = !!item.overwrite;
-  if (!overwrite && (await fileExists(abs))) {
-    session.skipped += 1;
-    const st = await fs.stat(abs);
-    return { relPath: safeRel, status: "skipped", reason: "exists", bytes: st.size };
-  }
-
-  const result = await enqueueDownload(session, item.sourceUrl, abs);
-  return { relPath: safeRel, ...result };
+  logIngestResult(session, sourceUrl, abs, result);
+  return result;
 }
 
 async function handleRequest(req, res) {
@@ -331,7 +392,14 @@ async function handleRequest(req, res) {
       };
       await fs.mkdir(gameDir, { recursive: true });
       sessions.set(sessionId, session);
-      log("session start", sessionId, gameDir);
+      log(
+        "session start",
+        sessionId,
+        "| game:",
+        gameName,
+        "| dir:",
+        gameDir
+      );
       return json(res, 200, {
         ok: true,
         sessionId,
@@ -365,7 +433,20 @@ async function handleRequest(req, res) {
         failed: session.failed
       };
       sessions.delete(session.sessionId);
-      log("session finish", body.sessionId, stats);
+      log(
+        "session finish",
+        body.sessionId,
+        "| game:",
+        session.gameName,
+        "| dir:",
+        session.gameDir,
+        "| ok:",
+        stats.downloaded,
+        "skip:",
+        stats.skipped,
+        "fail:",
+        stats.failed
+      );
       return json(res, 200, { ok: true, stats, gameDir: session.gameDir });
     }
 
@@ -422,6 +503,9 @@ async function handleRequest(req, res) {
       const session = sessions.get(body.sessionId);
       if (!session) return json(res, 404, { ok: false, error: "session not found" });
       const items = Array.isArray(body.items) ? body.items : [];
+      if (items.length > 0 && LOG_INGEST) {
+        log("batch ingest", items.length, "item(s) |", session.gameName);
+      }
       const results = [];
       for (const item of items) {
         results.push(await ingestOne(session, item));
