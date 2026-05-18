@@ -1,6 +1,5 @@
 import * as localSink from "./local-sink.js";
 
-const OUTPUT_PREFIX = "downloaded-games";
 
 /** 下载选项：chrome.downloads 回退时使用 */
 const DOWNLOAD_OPTS = { conflictAction: "overwrite", saveAs: false };
@@ -551,7 +550,7 @@ async function startMonitor(tabId, options = {}) {
   }
 
   const gameName = sanitizeName(pageInfo.gameName || "poki-game");
-  const folder = `${OUTPUT_PREFIX}/${gameName}`;
+  const folder = gameName;
 
   localSink.clearSession();
   const sinkReady = await localSink.ensureReady(sinkSettings || {});

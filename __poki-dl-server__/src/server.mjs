@@ -247,7 +247,8 @@ async function handleRequest(req, res) {
       const outputRoot = path.resolve(
         String(body.outputRoot || DEFAULT_OUTPUT_ROOT).trim()
       );
-      const relPrefix = String(body.relPrefix || `downloaded-games/${gameName}`)
+      const relPrefix = String(body.relPrefix || gameName)
+        .replace(/^\/+|\/+$/g, "");
         .replace(/\\/g, "/")
         .replace(/^\/+|\/+$/g, "");
       const gameDir = path.join(outputRoot, relPrefix);

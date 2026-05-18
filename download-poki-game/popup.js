@@ -10,8 +10,8 @@ const importConfigBtn = document.getElementById("importConfigBtn");
 const importFileEl = document.getElementById("importFile");
 const clearConfigBtn = document.getElementById("clearConfigBtn");
 const useLocalSinkEl = document.getElementById("useLocalSink");
-const sinkServerInfoEl = document.getElementById("sinkServerInfo");
-const sinkOutputInfoEl = document.getElementById("sinkOutputInfo");
+const sinkServerUrlEl = document.getElementById("sinkServerUrl");
+const sinkOutputRootEl = document.getElementById("sinkOutputRoot");
 const testSinkBtn = document.getElementById("testSinkBtn");
 
 const POPUP_CONFIG_KEY = "popupConfig";
@@ -109,50 +109,29 @@ function getManualResourceUrls() {
 }
 
 function getSinkSettings() {
-  return { enabled: !!useLocalSinkEl?.checked };
-}
-
-function saveSinkPreference() {
-  return chrome.storage.local.set({
-    [SINK_SETTINGS_KEY]: { enabled: !!useLocalSinkEl?.checked }
-  });
+  return {
+    enabled: !!useLocalSinkEl?.checked,
+    serverUrl: (sinkServerUrlEl?.value || DEFAULT_SERVER_URL).trim().replace(/\/+$/, ""),
+    outputRoot: (sinkOutputRootEl?.value || "").trim()
+  };
 }
 
 function savePopupConfig() {
   const manualGameUrl = manualGameUrlEl.value.trim() || null;
   const manualResourceUrls = getManualResourceUrls();
-  chrome.storage.local.set({
-    [POPUP_CONFIG_KEY]: { manualGameUrl, manualResourceUrls }
+  const sinkSettings = getSinkSettings();
+  return chrome.storage.local.set({
+    [POPUP_CONFIG_KEY]: { manualGameUrl, manualResourceUrls },
+    [SINK_SETTINGS_KEY]: sinkSettings
   });
-  return saveSinkPreference();
 }
 
 async function loadSinkSettings() {
   const stored = await chrome.storage.local.get(SINK_SETTINGS_KEY);
   const sink = stored[SINK_SETTINGS_KEY] || {};
   if (useLocalSinkEl) useLocalSinkEl.checked = sink.enabled !== false;
-  await refreshSinkInfoDisplay();
-}
-
-async function refreshSinkInfoDisplay() {
-  if (sinkServerInfoEl) sinkServerInfoEl.textContent = DEFAULT_SERVER_URL;
-  if (!useLocalSinkEl?.checked) {
-    if (sinkOutputInfoEl) sinkOutputInfoEl.textContent = "（未启用）";
-    return null;
-  }
-  try {
-    const res = await fetch(`${DEFAULT_SERVER_URL}/health`);
-    const data = await res.json();
-    if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
-    const root = data.defaultOutputRoot || "—";
-    if (sinkOutputInfoEl) sinkOutputInfoEl.textContent = root;
-    return data;
-  } catch (e) {
-    if (sinkOutputInfoEl) {
-      sinkOutputInfoEl.textContent = "无法连接，请先执行 npm run poki-server";
-    }
-    return null;
-  }
+  if (sinkServerUrlEl) sinkServerUrlEl.value = sink.serverUrl || DEFAULT_SERVER_URL;
+  if (sinkOutputRootEl && sink.outputRoot) sinkOutputRootEl.value = sink.outputRoot;
 }
 
 async function loadPopupConfig() {
@@ -203,24 +182,29 @@ manualResourceListEl.addEventListener("blur", (e) => {
 void loadPopupConfig();
 void loadSinkSettings();
 
-if (useLocalSinkEl) {
-  useLocalSinkEl.addEventListener("change", () => {
-    void saveSinkPreference().then(() => refreshSinkInfoDisplay());
-  });
-}
+if (useLocalSinkEl) useLocalSinkEl.addEventListener("change", () => savePopupConfig());
+if (sinkServerUrlEl) sinkServerUrlEl.addEventListener("blur", () => savePopupConfig());
+if (sinkOutputRootEl) sinkOutputRootEl.addEventListener("blur", () => savePopupConfig());
 
 async function probeLocalServer() {
-  await saveSinkPreference();
-  if (!useLocalSinkEl?.checked) {
+  const sink = getSinkSettings();
+  await savePopupConfig();
+  if (!sink.enabled) {
     return { ok: true, message: "已关闭本地服务，将使用 Chrome 下载" };
   }
-  const data = await refreshSinkInfoDisplay();
-  if (!data?.defaultOutputRoot) {
-    throw new Error("无法获取输出目录，请确认 npm run poki-server 已从仓库根目录启动");
+  const base = sink.serverUrl.replace(/\/+$/, "");
+  const res = await fetch(`${base}/health`);
+  const data = await res.json();
+  if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+  if (!sink.outputRoot) {
+    return {
+      ok: true,
+      message: `服务正常（${base}）\n请填写「输出根目录」`
+    };
   }
   return {
     ok: true,
-    message: `本地服务正常\n${DEFAULT_SERVER_URL}\n输出: ${data.defaultOutputRoot}`
+    message: `本地服务正常\n${base}\n输出: ${sink.outputRoot}`
   };
 }
 
@@ -235,7 +219,7 @@ if (testSinkBtn) {
     } catch (e) {
       const msg = e?.message || String(e);
       setError(
-        `本地服务不可用: ${msg}\n\n请执行: npm run poki-server\n服务地址: ${DEFAULT_SERVER_URL}`
+        `本地服务不可用: ${msg}\n\n请执行: npm run poki-server\n服务地址: ${sinkServerUrlEl?.value || DEFAULT_SERVER_URL}`
       );
     } finally {
       testSinkBtn.disabled = false;
@@ -265,6 +249,9 @@ startBtn.addEventListener("click", async () => {
 
     savePopupConfig();
     const sinkSettings = getSinkSettings();
+    if (sinkSettings.enabled && !sinkSettings.outputRoot) {
+      throw new Error("请填写「输出根目录」后再开始监听。");
+    }
 
     const result = await chrome.runtime.sendMessage({
       type: "START_MONITOR",
@@ -280,9 +267,7 @@ startBtn.addEventListener("click", async () => {
     const usedManualUrl = !!manualGameUrl && manualGameUrl.startsWith("http");
     let sinkLine = "\n写盘: Chrome 下载（可能弹窗，建议启用本地服务）";
     if (result.sinkMode === "local-server") {
-      const health = await refreshSinkInfoDisplay();
-      const root = health?.defaultOutputRoot || "（见 npm run poki-server）";
-      sinkLine = `\n写盘: 本地服务 → ${root}/${result.folder}/`;
+      sinkLine = `\n写盘: 本地服务 → ${sinkSettings.outputRoot}/${result.folder}/`;
     }
     let statusMsg = usedManualUrl
       ? `监听已开启！\n游戏: ${result.gameName}\n目录: ${result.folder}/${sinkLine}\n\n已使用游戏地址，页面将自动刷新，资源会通过 CDP 抓取并保存。`

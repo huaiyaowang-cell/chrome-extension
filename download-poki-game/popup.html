@@ -261,16 +261,15 @@
 
     <div class="config-section">
       <h2>本地写盘服务</h2>
-      <p class="config-desc">在仓库根目录执行 <code>npm run poki-server</code>。输出目录由服务决定，两个扩展共用同一配置。已存在文件会跳过，避免 Chrome 下载弹窗。</p>
+      <p class="config-desc">先运行 <code>npm run poki-server</code>。两个扩展共用下方配置；游戏按名称落在输出目录下。已存在文件会跳过。</p>
       <label class="checkbox-row">
         <input type="checkbox" id="useLocalSink" checked />
         使用本地服务写盘（推荐）
       </label>
-      <p class="config-desc sink-fixed-info">
-        服务地址：<code id="sinkServerInfo">http://127.0.0.1:22222</code><br/>
-        输出目录（由 <code>npm run poki-server</code> 决定，不可修改）：<br/>
-        <code id="sinkOutputInfo">—</code>
-      </p>
+      <label class="field-label" for="sinkServerUrl">服务地址</label>
+      <input type="text" id="sinkServerUrl" class="full-width" value="http://127.0.0.1:22222" />
+      <label class="field-label" for="sinkOutputRoot">输出根目录（绝对路径）</label>
+      <input type="text" id="sinkOutputRoot" class="full-width" placeholder="/Users/you/work/chrome-extension" />
       <button type="button" id="testSinkBtn" class="secondary" style="margin-top:8px">检测本地服务</button>
     </div>
 
@@ -320,7 +319,7 @@
       </div>
     </div>
 
-    <div class="hint">本地服务：{输出根目录}/downloaded-games/&lt;game-name&gt;/</div>
+    <div class="hint">本地服务：{输出根目录}/&lt;game-name&gt;/</div>
     <script src="popup.js"></script>
   </body>
 </html>

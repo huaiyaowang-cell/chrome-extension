@@ -132,7 +132,7 @@
   </head>
   <body>
     <h1>补全 404 资源</h1>
-    <p class="hint top-hint">与 download-poki-game 共用本地服务。落盘：<code>{输出根}/downloaded-games/&lt;游戏名&gt;/</code></p>
+    <p class="hint top-hint">与 download-poki-game 共用本地服务。落盘：<code>{输出根}/&lt;游戏名&gt;/</code></p>
 
     <div class="section sink-section">
       <div class="section-title">本地写盘</div>
@@ -140,11 +140,14 @@
         <input type="checkbox" id="useLocalSink" checked />
         使用本地服务（npm run poki-server）
       </label>
-      <p class="hint sink-fixed-info">
-        服务地址：<code id="sinkServerInfo">http://127.0.0.1:22222</code><br/>
-        输出目录（由 <code>npm run poki-server</code> 决定，不可修改）：<br/>
-        <code id="sinkOutputInfo">—</code>
-      </p>
+      <div class="form-row">
+        <label>服务地址</label>
+        <input type="text" id="sinkServerUrl" value="http://127.0.0.1:22222" />
+      </div>
+      <div class="form-row">
+        <label>输出根目录</label>
+        <input type="text" id="sinkOutputRoot" placeholder="/Users/you/work/chrome-extension" />
+      </div>
       <div class="btn-row">
         <button type="button" class="secondary" id="testSinkBtn">检测服务</button>
         <button type="button" class="secondary" id="importManifestBtn">读 manifest</button>
@@ -154,10 +157,6 @@
     <div class="form-row">
       <label>游戏 CDN 根地址</label>
       <input type="text" id="domain" placeholder="minigame 或 Poki 完整地址均可" />
-    </div>
-    <div class="form-row">
-      <label>下载目录</label>
-      <input type="text" id="downloadDir" value="downloaded-games" placeholder="downloaded-games" />
     </div>
     <div class="form-row">
       <label>游戏名（可选）</label>

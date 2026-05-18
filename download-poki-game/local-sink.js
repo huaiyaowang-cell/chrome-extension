@@ -1,6 +1,5 @@
 /**
  * HTTP client for tools/poki-dl-server — replaces chrome.downloads when enabled.
- * 输出目录仅来自本地服务 /health（与 npm run poki-server 启动配置一致），扩展不可改。
  */
 
 export const SINK_SETTINGS_KEY = "pokiSinkSettings";
@@ -21,6 +20,17 @@ let flushTimer = null;
 /** @type {Promise<{ results: object[] }>} */
 let flushChain = Promise.resolve({ results: [] });
 
+function mergeSinkSettings(saved = {}, overrides = {}) {
+  const serverUrl = String(overrides.serverUrl ?? saved.serverUrl ?? DEFAULT_SERVER_URL)
+    .trim()
+    .replace(/\/+$/, "");
+  return {
+    enabled: overrides.enabled ?? saved.enabled ?? true,
+    serverUrl: serverUrl || DEFAULT_SERVER_URL,
+    outputRoot: String(overrides.outputRoot ?? saved.outputRoot ?? "").trim()
+  };
+}
+
 export function isEnabled() {
   return !!settings?.enabled;
 }
@@ -28,38 +38,33 @@ export function isEnabled() {
 async function refreshOutputRootFromServer() {
   const health = await healthCheck();
   const root = String(health.defaultOutputRoot || "").trim();
-  if (!root) {
-    throw new Error(
-      "本地服务未返回输出目录。请在仓库根目录执行 npm run poki-server，或设置环境变量 POKI_DL_OUTPUT_ROOT"
-    );
-  }
-  settings.outputRoot = root;
+  if (root) settings.outputRoot = root;
   return root;
 }
 
 export async function loadSettings(overrides = {}) {
   const stored = await chrome.storage.local.get(SINK_SETTINGS_KEY);
   const saved = stored[SINK_SETTINGS_KEY] || {};
-  settings = {
-    enabled: overrides.enabled ?? saved.enabled ?? true,
-    serverUrl: DEFAULT_SERVER_URL,
-    outputRoot: ""
-  };
-  if (settings.enabled) {
-    await refreshOutputRootFromServer();
+  settings = mergeSinkSettings(saved, overrides);
+  if (settings.enabled && !settings.outputRoot) {
+    try {
+      await refreshOutputRootFromServer();
+    } catch {
+      /* 未填输出目录且服务不可用时保留空值，由调用方校验 */
+    }
   }
   return settings;
 }
 
 export async function saveSettings(next) {
-  const enabled = next?.enabled !== false;
-  await chrome.storage.local.set({ [SINK_SETTINGS_KEY]: { enabled } });
-  settings = {
-    enabled,
-    serverUrl: DEFAULT_SERVER_URL,
-    outputRoot: ""
-  };
-  if (enabled) await refreshOutputRootFromServer();
+  settings = mergeSinkSettings(settings || {}, next || {});
+  await chrome.storage.local.set({
+    [SINK_SETTINGS_KEY]: {
+      enabled: settings.enabled !== false,
+      serverUrl: settings.serverUrl,
+      outputRoot: settings.outputRoot
+    }
+  });
   return settings;
 }
 
@@ -102,7 +107,7 @@ export async function pingServer(overrides = {}) {
   const health = await healthCheck();
   return {
     mode: "local-server",
-    serverUrl: DEFAULT_SERVER_URL,
+    serverUrl: settings.serverUrl,
     outputRoot: settings.outputRoot,
     ...health
   };
@@ -111,13 +116,17 @@ export async function pingServer(overrides = {}) {
 export async function ensureReady(overrides) {
   await loadSettings(overrides);
   if (!settings.enabled) return { mode: "chrome-downloads" };
-  if (!settings.outputRoot) await refreshOutputRootFromServer();
+  if (!settings.outputRoot) {
+    throw new Error("请填写「输出根目录」");
+  }
   return pingServer(overrides);
 }
 
 export async function startSession(opts) {
   if (!isEnabled()) return null;
-  if (!settings.outputRoot) await refreshOutputRootFromServer();
+  if (!settings.outputRoot) {
+    throw new Error("请填写「输出根目录」");
+  }
   const data = await api("/api/session/start", {
     method: "POST",
     body: {

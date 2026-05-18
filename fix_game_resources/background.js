@@ -8,7 +8,8 @@ import * as localSink from "./local-sink.js";
 const STORAGE_404 = "fixGameResources_404";
 const STORAGE_SETTINGS = "fixGameResources_settings";
 const STORAGE_LISTENING = "fixGameResources_listeningTabId";
-const DEFAULT_DOWNLOAD_DIR = "downloaded-games";
+/** @deprecated 旧版 storage 可能含 downloadDir，已忽略 */
+const LEGACY_DOWNLOAD_DIR = "downloaded-games";
 
 /** @type {{ relPrefix: string, gameName: string, domain: string, pageUrl: string } | null} */
 let activeFixSession = null;
@@ -121,7 +122,6 @@ async function getSettings() {
   const s = raw[STORAGE_SETTINGS] || {};
   return {
     domain: s.domain || "",
-    downloadDir: (s.downloadDir || DEFAULT_DOWNLOAD_DIR).trim(),
     gameName: s.gameName || ""
   };
 }
@@ -130,7 +130,6 @@ async function saveSettingsToStorage(settings) {
   const domain = gameUrlToCdnRoot(settings.domain) || normalizeGameDomainUrl(settings.domain);
   const next = {
     domain,
-    downloadDir: String(settings.downloadDir || DEFAULT_DOWNLOAD_DIR).trim() || DEFAULT_DOWNLOAD_DIR,
     gameName: String(settings.gameName || "").trim()
   };
   await chrome.storage.local.set({ [STORAGE_SETTINGS]: next });
@@ -211,7 +210,6 @@ async function syncSettingsFromPageUrl(pageUrl, options = {}) {
   const prev = await getSettings();
   const next = {
     domain,
-    downloadDir: prev.downloadDir || DEFAULT_DOWNLOAD_DIR,
     gameName: gameName || prev.gameName || gameNameFromUrl
   };
 
@@ -260,12 +258,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 function parseGameNameFromUrl(pageUrl) {
   if (!pageUrl || !pageUrl.startsWith("http")) return "";
   try {
-    const pathname = new URL(pageUrl).pathname;
-    const segments = pathname.split("/").filter(Boolean);
-    if (segments[0] === DEFAULT_DOWNLOAD_DIR && segments[1]) {
-      return segments[1];
+    let segments = new URL(pageUrl).pathname.split("/").filter(Boolean);
+    if (segments.length === 0) return "";
+    if (/\.html?$/i.test(segments[segments.length - 1])) {
+      segments = segments.slice(0, -1);
     }
-    return segments[0] || "";
+    if (segments[0] === LEGACY_DOWNLOAD_DIR && segments.length > 1) {
+      segments = segments.slice(1);
+    }
+    return segments[segments.length - 1] || "";
   } catch {
     return "";
   }
@@ -297,14 +298,13 @@ function buildRemoteAndLocal(settings, pageUrl, encodedRel) {
   const domain = normalizeGameDomainUrl(settings.domain).replace(/\/+$/, "");
   let gameName = (settings.gameName || "").trim();
   if (!gameName) gameName = parseGameNameFromUrl(pageUrl);
-  const downloadDir = (settings.downloadDir || DEFAULT_DOWNLOAD_DIR).replace(/^\/+|\/+$/g, "");
   const rel = (encodedRel || "").replace(/^\//, "");
   if (!domain || !gameName || !rel) {
     throw new Error("缺少游戏域名、游戏名或相对路径");
   }
   const sourceUrl = `${domain}/${rel}`;
   const relForFile = relPathForFile(rel);
-  const relPrefix = `${downloadDir}/${gameName}`;
+  const relPrefix = gameName;
   return { sourceUrl, relPath: relForFile, relPrefix, gameName, domain };
 }
 
@@ -312,8 +312,7 @@ async function ensureFixSession(settings, pageUrl) {
   if (!localSink.isEnabled()) return;
   let gameName = (settings.gameName || "").trim();
   if (!gameName) gameName = parseGameNameFromUrl(pageUrl);
-  const downloadDir = (settings.downloadDir || DEFAULT_DOWNLOAD_DIR).replace(/^\/+|\/+$/g, "");
-  const relPrefix = `${downloadDir}/${gameName}`;
+  const relPrefix = gameName;
   const domainNorm = normalizeGameDomainUrl(settings.domain);
   if (
     activeFixSession &&
@@ -389,8 +388,7 @@ async function autoDownloadOne(tabId, pageUrl, entry) {
   await syncSettingsFromPageUrl(pageUrl);
   const settings = await getSettings();
   const domain = (settings.domain || "").trim();
-  const downloadDir = (settings.downloadDir || "").trim();
-  if (!domain || !downloadDir) return;
+  if (!domain) return;
 
   try {
     await saveOneResource(settings, pageUrl, entry.relativePath);
@@ -569,8 +567,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === "SAVE_SETTINGS") {
-    const { domain = "", downloadDir = "", gameName = "" } = message;
-    saveSettingsToStorage({ domain, downloadDir, gameName })
+    const { domain = "", gameName = "" } = message;
+    saveSettingsToStorage({ domain, gameName })
       .then((s) => sendResponse({ ok: true, settings: s }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -601,9 +599,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === "DOWNLOAD_404") {
-    const { tabId, items, domain, downloadDir, gameName } = message;
-    if (!items?.length || !domain || !downloadDir) {
-      sendResponse({ ok: false, error: "缺少 domain、downloadDir 或 items" });
+    const { tabId, items, domain, gameName } = message;
+    if (!items?.length || !domain) {
+      sendResponse({ ok: false, error: "缺少 domain 或 items" });
       return true;
     }
 
@@ -618,7 +616,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
         const settings = {
           domain: normalizeGameDomainUrl(domain),
-          downloadDir: downloadDir.trim() || DEFAULT_DOWNLOAD_DIR,
           gameName: String(gameName || "").trim()
         };
         await localSink.loadSettings(message.sinkSettings || {});

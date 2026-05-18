@@ -3,7 +3,6 @@
  */
 
 const domainEl = document.getElementById("domain");
-const downloadDirEl = document.getElementById("downloadDir");
 const gameNameEl = document.getElementById("gameName");
 const list404El = document.getElementById("list404");
 const failedSection = document.getElementById("failedSection");
@@ -13,15 +12,15 @@ const saveSettingsBtn = document.getElementById("saveSettings");
 const toggleListenBtn = document.getElementById("toggleListen");
 const clear404Btn = document.getElementById("clear404");
 const useLocalSinkEl = document.getElementById("useLocalSink");
-const sinkServerInfoEl = document.getElementById("sinkServerInfo");
-const sinkOutputInfoEl = document.getElementById("sinkOutputInfo");
+const sinkServerUrlEl = document.getElementById("sinkServerUrl");
+const sinkOutputRootEl = document.getElementById("sinkOutputRoot");
 const testSinkBtn = document.getElementById("testSinkBtn");
 const importManifestBtn = document.getElementById("importManifestBtn");
 
 const SINK_SETTINGS_KEY = "pokiSinkSettings";
 const STORAGE_SETTINGS = "fixGameResources_settings";
-const DEFAULT_DOWNLOAD_DIR = "downloaded-games";
 const DEFAULT_SERVER_URL = "http://127.0.0.1:22222";
+const LEGACY_DOWNLOAD_DIR = "downloaded-games";
 
 let currentTabId = null;
 let current404List = [];
@@ -54,16 +53,26 @@ function normalizeGameDomainUrl(input) {
 function parseGameNameFromUrl(url) {
   if (!url || !url.startsWith("http")) return "";
   try {
-    const segments = new URL(url).pathname.split("/").filter(Boolean);
-    if (segments[0] === DEFAULT_DOWNLOAD_DIR && segments[1]) return segments[1];
-    return segments[0] || "";
+    let segments = new URL(url).pathname.split("/").filter(Boolean);
+    if (segments.length === 0) return "";
+    if (/\.html?$/i.test(segments[segments.length - 1])) {
+      segments = segments.slice(0, -1);
+    }
+    if (segments[0] === LEGACY_DOWNLOAD_DIR && segments.length > 1) {
+      segments = segments.slice(1);
+    }
+    return segments[segments.length - 1] || "";
   } catch {
     return "";
   }
 }
 
 function getSinkSettings() {
-  return { enabled: !!useLocalSinkEl?.checked };
+  return {
+    enabled: !!useLocalSinkEl?.checked,
+    serverUrl: (sinkServerUrlEl?.value || DEFAULT_SERVER_URL).trim().replace(/\/+$/, ""),
+    outputRoot: (sinkOutputRootEl?.value || "").trim()
+  };
 }
 
 async function saveSinkSettings() {
@@ -72,32 +81,12 @@ async function saveSinkSettings() {
   return sink;
 }
 
-async function refreshSinkInfoDisplay() {
-  if (sinkServerInfoEl) sinkServerInfoEl.textContent = DEFAULT_SERVER_URL;
-  if (!useLocalSinkEl?.checked) {
-    if (sinkOutputInfoEl) sinkOutputInfoEl.textContent = "（未启用）";
-    return null;
-  }
-  try {
-    const res = await fetch(`${DEFAULT_SERVER_URL}/health`);
-    const data = await res.json();
-    if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
-    const root = data.defaultOutputRoot || "—";
-    if (sinkOutputInfoEl) sinkOutputInfoEl.textContent = root;
-    return data;
-  } catch {
-    if (sinkOutputInfoEl) {
-      sinkOutputInfoEl.textContent = "无法连接，请先执行 npm run poki-server";
-    }
-    return null;
-  }
-}
-
 async function loadSinkSettings() {
   const stored = await chrome.storage.local.get(SINK_SETTINGS_KEY);
   const sink = stored[SINK_SETTINGS_KEY] || {};
   if (useLocalSinkEl) useLocalSinkEl.checked = sink.enabled !== false;
-  await refreshSinkInfoDisplay();
+  if (sinkServerUrlEl) sinkServerUrlEl.value = sink.serverUrl || DEFAULT_SERVER_URL;
+  if (sinkOutputRootEl && sink.outputRoot) sinkOutputRootEl.value = sink.outputRoot;
 }
 
 async function getActiveTab() {
@@ -109,7 +98,6 @@ function applySettingsToForm(settings) {
   if (!settings) return;
   domainEl.value =
     normalizeGameDomainUrl(settings.domain || "") || settings.domain || "";
-  downloadDirEl.value = settings.downloadDir || DEFAULT_DOWNLOAD_DIR;
   gameNameEl.value = settings.gameName || "";
 }
 
@@ -127,13 +115,11 @@ async function loadSettings() {
 async function saveAllSettings() {
   const rawDomain = domainEl.value.trim();
   const domain = normalizeGameDomainUrl(rawDomain) || rawDomain;
-  const downloadDir = downloadDirEl.value.trim() || DEFAULT_DOWNLOAD_DIR;
   const gameName = gameNameEl.value.trim();
   await saveSinkSettings();
   const res = await chrome.runtime.sendMessage({
     type: "SAVE_SETTINGS",
     domain,
-    downloadDir,
     gameName
   });
   return res;
@@ -289,7 +275,7 @@ saveSettingsBtn.addEventListener("click", async () => {
       showStatus(res?.error || "保存失败", "error");
     }
   } catch (e) {
-    showStatus("保存失败: " + (e.message || e), "error");
+    showStatus("保存失败: " + (e?.message || e), "error");
   }
 });
 
@@ -322,10 +308,11 @@ toggleListenBtn.addEventListener("click", async () => {
     return;
   }
 
-  const downloadDir = downloadDirEl.value.trim() || DEFAULT_DOWNLOAD_DIR;
-  downloadDirEl.value = downloadDir;
-
   const sinkSettings = getSinkSettings();
+  if (sinkSettings.enabled && !sinkSettings.outputRoot) {
+    showStatus("请填写「输出根目录」。", "error");
+    return;
+  }
 
   await saveAllSettings();
   toggleListenBtn.disabled = true;
@@ -385,20 +372,37 @@ clear404Btn.addEventListener("click", async () => {
   }
 });
 
-/** 弹窗内直接请求 /health（不依赖 Service Worker，避免误报「检测失败」） */
 async function probeLocalServer() {
+  const sink = getSinkSettings();
   await saveSinkSettings();
-  if (!useLocalSinkEl?.checked) {
+  if (!sink.enabled) {
     return { ok: true, mode: "chrome-downloads", message: "已关闭本地服务" };
   }
-  const data = await refreshSinkInfoDisplay();
-  if (!data?.defaultOutputRoot) {
-    throw new Error("无法获取输出目录，请确认 npm run poki-server 已从仓库根目录启动");
+  const base = sink.serverUrl.replace(/\/+$/, "");
+  const res = await fetch(`${base}/health`, { method: "GET" });
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+  if (!res.ok) {
+    throw new Error(data?.error || `HTTP ${res.status}`);
+  }
+  if (!data?.ok) {
+    throw new Error("服务返回异常");
+  }
+  if (!sink.outputRoot) {
+    return {
+      ok: true,
+      mode: "local-server",
+      message: `服务正常（${base}），请填写「输出根目录」后开始监听`
+    };
   }
   return {
     ok: true,
     mode: "local-server",
-    message: `服务正常\n${DEFAULT_SERVER_URL}\n输出: ${data.defaultOutputRoot}`
+    message: `服务正常\n${base}\n输出: ${sink.outputRoot}`
   };
 }
 
@@ -413,7 +417,7 @@ if (testSinkBtn) {
       const msg = e?.message || String(e);
       let hint = "请确认已执行: npm run poki-server";
       if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
-        hint += `\n并确认服务地址为 ${DEFAULT_SERVER_URL}`;
+        hint += `\n并确认服务地址为 ${sinkServerUrlEl?.value || DEFAULT_SERVER_URL}`;
       }
       showStatus(`本地服务不可用: ${msg}\n${hint}`, "error");
     } finally {
@@ -427,11 +431,9 @@ if (importManifestBtn) {
   importManifestBtn.addEventListener("click", () => void importFromManifest());
 }
 
-if (useLocalSinkEl) {
-  useLocalSinkEl.addEventListener("change", () => {
-    void saveSinkSettings().then(() => refreshSinkInfoDisplay());
-  });
-}
+if (useLocalSinkEl) useLocalSinkEl.addEventListener("change", () => void saveSinkSettings());
+if (sinkServerUrlEl) sinkServerUrlEl.addEventListener("blur", () => void saveSinkSettings());
+if (sinkOutputRootEl) sinkOutputRootEl.addEventListener("blur", () => void saveSinkSettings());
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes[STORAGE_SETTINGS]?.newValue) return;
