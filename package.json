@@ -1,0 +1,12 @@
+{
+  "name": "downloaded-games",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "poki-server": "node __poki-dl-server__/src/server.mjs",
+    "poki-server:games": "POKI_DL_OUTPUT_ROOT=./games node __poki-dl-server__/src/server.mjs"
+  },
+  "author": "",
+  "license": "ISC"
+}

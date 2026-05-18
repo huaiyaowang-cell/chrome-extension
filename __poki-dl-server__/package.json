@@ -1,0 +1,14 @@
+{
+  "name": "poki-dl-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local ingest server for download-poki-game extension",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
